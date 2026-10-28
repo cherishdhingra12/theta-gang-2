@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Theta Gang 2 — Playback Simulator</title>
+    <!-- Google Fonts: Fira Code, Outfit, Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Main Stylesheets -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=12.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/paper.css') }}?v=12.0">
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar: Playback Controls & Settings -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fa-solid fa-gamepad logo-icon text-cyan"></i>
+                    <span>Theta<span class="logo-accent">Gang 2</span></span>
+                </div>
+                <p class="sidebar-subtitle">Theta Gang 2 Simulator</p>
+            </div>
+
+            <!-- Navigation Links -->
+            <div class="nav-links">
+                <a href="/" class="nav-item"><i class="fa-solid fa-chart-area"></i> Historical Backtester</a>
+                <a href="/paper" class="nav-item active"><i class="fa-solid fa-terminal"></i> Playback Simulator</a>
+                <a href="/live" class="nav-item"><i class="fa-solid fa-tower-broadcast"></i> Live Trading Console</a>
+            </div>
+            
+            <form id="playback-form" class="sidebar-form">
+                <!-- Playback Date Selection -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-play"></i> Playback Settings</h3>
+                    <div class="form-group">
+                        <label for="playback-date">Select Historical Date</label>
+                        <input type="date" id="playback-date" required>
+                        <p class="file-help">Select a weekday within the last 30 days to play back real 1m spot data.</p>
+                    </div>
+                    <div class="form-group">
+                        <label for="playback-speed">Playback Speed (bars/sec)</label>
+                        <div class="speed-slider-container">
+                            <input type="range" id="playback-speed" min="1" max="60" value="10" class="speed-slider">
+                            <span id="speed-value" class="badge badge-ce">10x</span>
+                        </div>
+                        <p class="file-help">1x is real-time. 60x processes 1 minute of trading data every 1 second.</p>
+                    </div>
+                </div>
+
+                <!-- Bot Strategy Parameters -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-gears"></i> Strategy Parameters</h3>
+                    
+                    <div class="form-group">
+                        <label for="strategy_type">Strategy Type</label>
+                        <select id="strategy_type" name="strategy_type">
+                            <option value="BOTH">Short Strangle (PE + CE Sell)</option>
+                            <option value="PE_SELL">Put Option Only (PE Sell)</option>
+                            <option value="CE_SELL">Call Option Only (CE Sell)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="strike_offset_pe">PE Strike Offset</label>
+                            <input type="number" id="strike_offset_pe" name="strike_offset_pe" value="100" step="50">
+                        </div>
+                        <div class="form-group half">
+                            <label for="strike_offset_ce">CE Strike Offset</label>
+                            <input type="number" id="strike_offset_ce" name="strike_offset_ce" value="-100" step="50">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="entry_discount">Entry Discount (%)</label>
+                            <input type="number" id="entry_discount" name="entry_discount" value="10" min="1" max="50">
+                        </div>
+                        <div class="form-group half">
+                            <label for="lot_1_target">Lot 1 Target (%)</label>
+                            <input type="number" id="lot_1_target" name="lot_1_target" value="40" min="5" max="95">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="max_reentries">Max Entries / Day</label>
+                            <input type="number" id="max_reentries" name="max_reentries" value="5" min="1" max="10">
+                        </div>
+                        <div class="form-group half">
+                            <label for="lot_size">Lot Size</label>
+                            <input type="number" id="lot_size" name="lot_size" value="65" min="1">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="capital">Starting Capital (₹)</label>
+                            <input type="number" id="capital" name="capital" value="500000" min="50000">
+                        </div>
+                        <div class="form-group half">
+                            <label>Symbol</label>
+                            <input type="text" value="^NSEI (Nifty)" disabled class="disabled-input">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Simulation Control Buttons -->
+                <div class="control-actions">
+                    <button type="button" id="start-btn" class="btn btn-start"><i class="fa-solid fa-play"></i> Start Playback</button>
+                    <div class="form-row">
+                        <button type="button" id="pause-btn" class="btn btn-pause disabled" disabled><i class="fa-solid fa-pause"></i> Pause</button>
+                        <button type="button" id="stop-btn" class="btn btn-stop disabled" disabled><i class="fa-solid fa-stop"></i> Stop</button>
+                    </div>
+                </div>
+            </form>
+        </aside>
+
+        <!-- Main Real-Time Terminal View -->
+        <main class="main-content">
+            <!-- Header with Live Stats -->
+            <header class="main-header">
+                <div class="header-left">
+                    <h1>Real-Time Trading Console</h1>
+                    <p class="header-subtitle" id="playback-time-badge"><i class="fa-solid fa-clock"></i> Simulation Clock: 09:15 IST</p>
+                </div>
+                <div class="header-right">
+                    <div class="status-badge" id="playback-status-badge">
+                        <span class="pulse-dot status-stopped-dot" id="playback-status-dot"></span>
+                        <span id="playback-status-text">Stopped</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Live ticking Account & PnL bar -->
+            <section class="live-accounts-bar">
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Account Value</span>
+                    <span class="live-acc-value" id="live-net-equity">₹2,00,000.00</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Realized PnL</span>
+                    <span class="live-acc-value" id="live-realized-pnl">₹0.00</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Unrealized PnL</span>
+                    <span class="live-acc-value" id="live-unrealized-pnl">₹0.00</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Underlying Spot (Nifty)</span>
+                    <span class="live-acc-value ticker-val" id="live-spot-price">₹0.00</span>
+                </div>
+            </section>
+
+            <!-- Tickers Cards (CE and PE side-by-side) -->
+            <section class="tickers-panel">
+                <!-- PE Option Contract Card -->
+                <div class="option-ticker-card" id="pe-ticker-card">
+                    <div class="opt-card-header">
+                        <span class="badge badge-pe">Put Option (PE)</span>
+                        <span class="opt-strike-label" id="pe-strike-lbl">Strike: -</span>
+                    </div>
+                    <div class="opt-price-row">
+                        <span class="opt-live-lbl">Live Premium</span>
+                        <span class="opt-live-val ticker-val" id="pe-live-price">₹0.00</span>
+                    </div>
+                    <div class="opt-details-grid">
+                        <div class="opt-det-item"><span>Day High (X)</span><span id="pe-day-high">-</span></div>
+                        <div class="opt-det-item"><span>Entry Order</span><span id="pe-entry-ord">-</span></div>
+                        <div class="opt-det-item"><span>Stop Loss</span><span id="pe-sl">-</span></div>
+                        <div class="opt-det-item"><span>Target</span><span id="pe-target">-</span></div>
+                        <div class="opt-det-item"><span>Re-entries</span><span id="pe-reentries">-</span></div>
+                        <div class="opt-det-item"><span>Position</span><span id="pe-pos" class="badge">None</span></div>
+                    </div>
+                </div>
+
+                <!-- CE Option Contract Card -->
+                <div class="option-ticker-card" id="ce-ticker-card">
+                    <div class="opt-card-header">
+                        <span class="badge badge-ce">Call Option (CE)</span>
+                        <span class="opt-strike-label" id="ce-strike-lbl">Strike: -</span>
+                    </div>
+                    <div class="opt-price-row">
+                        <span class="opt-live-lbl">Live Premium</span>
+                        <span class="opt-live-val ticker-val" id="ce-live-price">₹0.00</span>
+                    </div>
+                    <div class="opt-details-grid">
+                        <div class="opt-det-item"><span>Day High (X)</span><span id="ce-day-high">-</span></div>
+                        <div class="opt-det-item"><span>Entry Order</span><span id="ce-entry-ord">-</span></div>
+                        <div class="opt-det-item"><span>Stop Loss</span><span id="ce-sl">-</span></div>
+                        <div class="opt-det-item"><span>Target</span><span id="ce-target">-</span></div>
+                        <div class="opt-det-item"><span>Re-entries</span><span id="ce-reentries">-</span></div>
+                        <div class="opt-det-item"><span>Position</span><span id="ce-pos" class="badge">None</span></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Real-Time Chart & Terminal Console -->
+            <section class="live-charts-logs">
+                <!-- Real-time ticks chart -->
+                <div class="live-chart-container">
+                    <div class="chart-header">
+                        <h3><i class="fa-solid fa-chart-line"></i> Live Option Premium Chart</h3>
+                        <p class="chart-subtitle">Ticks received via background playback engine.</p>
+                    </div>
+                    <div class="live-chart-canvas">
+                        <canvas id="live-premium-chart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Terminal logs console -->
+                <div class="terminal-log-container">
+                    <div class="terminal-header">
+                        <span><i class="fa-solid fa-terminal"></i> Bot Execution Log Console</span>
+                        <span class="terminal-status" id="terminal-pulse">SYS OK</span>
+                    </div>
+                    <div class="terminal-body" id="terminal-body-log">
+                        <div class="terminal-line system-msg">>> SYSTEM: Playback Simulator Ready. Choose a date and start playback.</div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Main JavaScript App -->
+    <script src="{{ url_for('static', filename='js/paper.js') }}"></script>
+</body>
+</html>

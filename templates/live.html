@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Theta Gang 2 — Live Trading Console</title>
+    <!-- Google Fonts: Fira Code, Outfit, Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Main Stylesheets -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=12.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/live.css') }}?v=12.0">
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar: Live Control & Bot Config -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fa-solid fa-satellite-dish logo-icon terminal-glow live-pulse"></i>
+                    <span>Theta<span class="logo-accent">Gang 2</span></span>
+                </div>
+                <p class="sidebar-subtitle">Theta Gang 2 Live Engine</p>
+            </div>
+
+            <!-- Navigation Links -->
+            <div class="nav-links">
+                <a href="/" class="nav-item"><i class="fa-solid fa-chart-area"></i> Historical Backtester</a>
+                <a href="/paper" class="nav-item"><i class="fa-solid fa-terminal"></i> Playback Simulator</a>
+                <a href="/live" class="nav-item active"><i class="fa-solid fa-tower-broadcast"></i> Live Trading Console</a>
+            </div>
+            
+            <form id="live-form" class="sidebar-form">
+                <!-- Session Settings -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-network-wired"></i> Session Control</h3>
+                    
+                    <div class="form-group">
+                        <label for="feed-mode">Execution & Feed Mode</label>
+                        <select id="feed-mode" name="feed_mode">
+                            <option value="MOCK">Mock Simulator Mode (Weekend Testing)</option>
+                            <option value="LIVE">Live Feed (Paper Trading Mode)</option>
+                            <option value="LIVE_REAL" style="color: #EF4444; font-weight: bold;">⚡ Live Feed (REAL MONEY Execution)</option>
+                        </select>
+                        <p class="file-help">Select Paper Trading Mode for risk-free simulation or Real Money for actual broker orders.</p>
+                    </div>
+
+                    <!-- Auto-Pilot Toggle -->
+                    <div class="form-group" style="margin-top: 15px;">
+                        <div class="autopilot-toggle-row" style="display: flex; justify-content: space-between; align-items: center;">
+                            <label for="auto-pilot-toggle" style="margin-bottom: 0; font-weight: 500;">Auto-Pilot Mode</label>
+                            <label class="switch">
+                                <input type="checkbox" id="auto-pilot-toggle" name="auto_pilot">
+                                <span class="slider round"></span>
+                            </label>
+                        </div>
+                        <p class="file-help">When ON, bot auto-starts/stops during weekday market hours (09:15 - 15:30 IST).</p>
+                    </div>
+                </div>
+
+                <!-- Bot Strategy Parameters -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-gears"></i> Strategy Parameters</h3>
+                    
+                    <div class="form-group">
+                        <label for="strategy_type">Strategy Type</label>
+                        <select id="strategy_type" name="strategy_type">
+                            <option value="BOTH">Short Strangle (PE + CE Sell)</option>
+                            <option value="PE_SELL">Put Option Only (PE Sell)</option>
+                            <option value="CE_SELL">Call Option Only (CE Sell)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="strike_offset_pe">PE Strike Offset</label>
+                            <input type="number" id="strike_offset_pe" name="strike_offset_pe" value="100" step="50">
+                        </div>
+                        <div class="form-group half">
+                            <label for="strike_offset_ce">CE Strike Offset</label>
+                            <input type="number" id="strike_offset_ce" name="strike_offset_ce" value="-100" step="50">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="entry_discount">Entry Discount (%)</label>
+                            <input type="number" id="entry_discount" name="entry_discount" value="10" min="1" max="50">
+                        </div>
+                        <div class="form-group half">
+                            <label for="lot_1_target">Lot 1 Target (%)</label>
+                            <input type="number" id="lot_1_target" name="lot_1_target" value="40" min="5" max="95">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="max_reentries">Max Entries / Day</label>
+                            <input type="number" id="max_reentries" name="max_reentries" value="5" min="1" max="10">
+                        </div>
+                        <div class="form-group half">
+                            <label for="lot_size">Lot Size</label>
+                            <input type="number" id="lot_size" name="lot_size" value="65" min="1">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="capital">Starting Capital (₹)</label>
+                            <input type="number" id="capital" name="capital" value="500000" min="50000">
+                        </div>
+                        <div class="form-group half">
+                            <label>Ticker Symbol</label>
+                            <input type="text" value="NIFTY Index" disabled class="disabled-input">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Zerodha API Settings -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-key"></i> Zerodha API Feed</h3>
+                    
+                    <div class="form-group">
+                        <label for="kite_api_key">API Key</label>
+                        <input type="text" id="kite_api_key" name="kite_api_key" placeholder="Enter API Key">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="kite_api_secret">API Secret</label>
+                        <input type="password" id="kite_api_secret" name="kite_api_secret" placeholder="Enter API Secret">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="kite_user_id">User ID (Kite ID)</label>
+                        <input type="text" id="kite_user_id" name="kite_user_id" placeholder="Enter User ID">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="kite_password">Password</label>
+                        <input type="password" id="kite_password" name="kite_password" placeholder="Enter Password">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="kite_totp_secret">TOTP Secret Key</label>
+                        <input type="password" id="kite_totp_secret" name="kite_totp_secret" placeholder="Base32 code (Optional)">
+                        <p class="file-help">Leave TOTP blank to prompt manually once daily.</p>
+                    </div>
+                </div>
+
+                <!-- Simulation Control Buttons -->
+                <div class="control-actions">
+                    <button type="button" id="start-btn" class="btn btn-start"><i class="fa-solid fa-play"></i> Start Engine</button>
+                    <button type="button" id="stop-btn" class="btn btn-stop disabled" disabled><i class="fa-solid fa-stop"></i> Stop Engine</button>
+                    <button type="button" id="panic-btn" class="btn" style="width: 100%; margin-top: 8px; background: linear-gradient(135deg, #DC2626, #991B1B); color: white; font-weight: 700; border: 1px solid #F87171; box-shadow: 0 0 12px rgba(220, 38, 38, 0.4); cursor: pointer;"><i class="fa-solid fa-triangle-exclamation"></i> EMERGENCY PANIC EXIT</button>
+                    <button type="button" id="save-config-btn" class="btn btn-save" style="width: 100%; margin-top: 8px; background: #4B5563; color: white;"><i class="fa-solid fa-floppy-disk"></i> Save Config</button>
+                </div>
+            </form>
+        </aside>
+
+        <!-- Main Real-Time Terminal View -->
+        <main class="main-content">
+            <!-- Header with Live Stats -->
+            <header class="main-header">
+                <div class="header-left">
+                    <h1>Theta Gang 2 Live Trading Console</h1>
+                    <p class="header-subtitle" id="live-time-badge"><i class="fa-solid fa-circle-nodes"></i> Waiting for signal stream...</p>
+                </div>
+                <div class="header-right" style="display: flex; align-items: center;">
+                    <!-- Auto-Pilot Badge -->
+                    <div class="status-badge" id="autopilot-status-badge" style="margin-right: 10px; border-color: #F59E0B; color: #F59E0B;">
+                        <span class="pulse-dot status-autopilot-off-dot" id="autopilot-status-dot"></span>
+                        <span id="autopilot-status-text">Auto-Pilot Off</span>
+                    </div>
+                    <!-- Trade Log Button -->
+                    <button class="status-badge" id="trade-log-trigger-btn" style="margin-right: 10px; cursor: pointer; background: rgba(99, 102, 241, 0.1); border-color: #6366F1; color: #818CF8; outline: none; padding: 4px 10px; border-radius: 4px; display: flex; align-items: center;">
+                        <i class="fa-solid fa-list-check"></i>
+                        <span style="font-weight: 600; margin-left: 5px; font-family: inherit;">Trade Log</span>
+                    </button>
+                    <!-- Feed Mode Badge -->
+                    <div class="status-badge" id="feed-mode-badge" style="margin-right: 10px;">
+                        <i class="fa-solid fa-network-wired"></i>
+                        <span id="feed-mode-text" style="font-weight: 600;">MOCK MODE</span>
+                    </div>
+                    <!-- Connection Status Badge -->
+                    <div class="status-badge" id="live-status-badge">
+                        <span class="pulse-dot status-stopped-dot" id="live-status-dot"></span>
+                        <span id="live-status-text">Stopped</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Live ticking Account & PnL bar -->
+            <section class="live-accounts-bar">
+                <div class="live-acc-card highlight-inception-card">
+                    <span class="live-acc-title"><i class="fa-solid fa-trophy" style="color: #F59E0B; margin-right: 4px;"></i> Inception Total PnL</span>
+                    <span class="live-acc-value" id="live-inception-pnl">₹0.00</span>
+                    <span class="live-acc-sub" id="live-inception-sub">0 Trades | 0% Win Rate</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Account Value</span>
+                    <span class="live-acc-value" id="live-net-equity">₹5,00,000.00</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Today's Realized</span>
+                    <span class="live-acc-value" id="live-realized-pnl">₹0.00</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Today's Unrealized</span>
+                    <span class="live-acc-value" id="live-unrealized-pnl">₹0.00</span>
+                </div>
+                <div class="live-acc-card">
+                    <span class="live-acc-title">Nifty Spot Price</span>
+                    <span class="live-acc-value ticker-val" id="live-spot-price">₹0.00</span>
+                </div>
+            </section>
+
+            <!-- Dedicated Strategy Performance Inception Panel -->
+            <section class="inception-performance-panel">
+                <div class="inception-header">
+                    <div class="inception-title-group">
+                        <i class="fa-solid fa-chart-line inception-icon"></i>
+                        <div>
+                            <h3>Strategy Performance (Inception to Date)</h3>
+                            <p class="inception-subtitle">Cumulative tracked profit/loss, win statistics, and metrics since inception date <strong id="inc-start-date" style="color: #818CF8;">N/A</strong></p>
+                        </div>
+                    </div>
+                    <div class="inception-total-badge" id="inc-badge-pnl">
+                        <span class="inc-badge-label">TOTAL PnL:</span>
+                        <span class="inc-badge-value" id="inc-total-pnl-val">₹0.00</span>
+                    </div>
+                </div>
+                <div class="inception-stats-grid">
+                    <div class="inc-stat-item">
+                        <span class="inc-stat-label">Inception Net PnL</span>
+                        <span class="inc-stat-value" id="inc-net-pnl">₹0.00</span>
+                    </div>
+                    <div class="inc-stat-item">
+                        <span class="inc-stat-label">Completed Trades</span>
+                        <span class="inc-stat-value" id="inc-total-trades">0</span>
+                    </div>
+                    <div class="inc-stat-item">
+                        <span class="inc-stat-label">Win Rate</span>
+                        <span class="inc-stat-value" id="inc-win-rate">0.0%</span>
+                    </div>
+                    <div class="inc-stat-item">
+                        <span class="inc-stat-label">Profit Factor</span>
+                        <span class="inc-stat-value" id="inc-profit-factor">N/A</span>
+                    </div>
+                    <div class="inc-stat-item">
+                        <span class="inc-stat-label">Gross Profit</span>
+                        <span class="inc-stat-value text-green" id="inc-gross-profit">₹0.00</span>
+                    </div>
+                    <div class="inc-stat-item">
+                        <span class="inc-stat-label">Gross Loss</span>
+                        <span class="inc-stat-value text-red" id="inc-gross-loss">₹0.00</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Info Bar for Expiry and Market Hours -->
+            <section class="market-info-bar">
+                <div class="info-item">
+                    <i class="fa-solid fa-calendar-days"></i>
+                    <span>Selected Expiry: <strong id="live-expiry">Loading...</strong></span>
+                </div>
+                <div class="info-item">
+                    <i class="fa-solid fa-clock-rotate-left"></i>
+                    <span>Market Status: <strong id="market-status-val" class="text-orange">UNKNOWN</strong></span>
+                </div>
+            </section>
+
+            <!-- Zerodha Margin & Account Status Panel -->
+            <section class="margin-utilization-panel">
+                <div class="margin-header">
+                    <div class="margin-title-group">
+                        <i class="fa-solid fa-shield-halved margin-icon"></i>
+                        <div>
+                            <h3>Zerodha Margin Utilization & Account Status</h3>
+                            <p class="margin-subtitle">Real-time margin usage, maximum strategy margin required, and Zerodha hedging benefits</p>
+                        </div>
+                    </div>
+                    <div class="margin-account-badge" id="margin-account-type-badge" style="background: rgba(59, 130, 246, 0.15); color: #60A5FA; border-color: rgba(59, 130, 246, 0.35);">
+                        <i class="fa-solid fa-server"></i> <span id="margin-account-type-text">PAPER TRADING (ZERODHA MARGIN RULES)</span>
+                    </div>
+                </div>
+                
+                <div class="margin-stats-grid">
+                    <div class="margin-card main-margin">
+                        <span class="margin-card-label">Utilized Margin (Current)</span>
+                        <span class="margin-card-value" id="margin-utilized-val">₹0.00</span>
+                        <div class="margin-bar-container">
+                            <div class="margin-bar-fill" id="margin-bar-fill" style="width: 0%;"></div>
+                        </div>
+                        <span class="margin-card-sub" id="margin-utilization-pct">0.0% of Capital Utilized</span>
+                    </div>
+                    
+                    <div class="margin-card">
+                        <span class="margin-card-label">Max Strategy Margin Required</span>
+                        <span class="margin-card-value" id="margin-max-required-val">₹0.00</span>
+                        <span class="margin-card-sub" style="color: #A5B4FC;">Full 2-Leg + Re-entry Margin</span>
+                    </div>
+
+                    <div class="margin-card">
+                        <span class="margin-card-label">Zerodha Hedging Benefit (Savings)</span>
+                        <span class="margin-card-value text-green" id="margin-hedging-benefit-val">₹0.00</span>
+                        <span class="margin-card-sub" style="color: #34D399;">Multi-leg Margin Reduction</span>
+                    </div>
+
+                    <div class="margin-card">
+                        <span class="margin-card-label">Available Free Margin</span>
+                        <span class="margin-card-value" id="margin-available-val">₹0.00</span>
+                        <span class="margin-card-sub" id="margin-available-sub">Available for Orders</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tickers Cards (CE and PE side-by-side) -->
+            <section class="tickers-panel">
+                <!-- PE Option Contract Card -->
+                <div class="option-ticker-card" id="pe-ticker-card">
+                    <div class="opt-card-header">
+                        <span class="badge badge-pe">Put Option (PE)</span>
+                        <span class="opt-strike-label" id="pe-strike-lbl">Strike: -</span>
+                    </div>
+                    <div class="opt-price-row">
+                        <span class="opt-live-lbl">Live Premium</span>
+                        <span class="opt-live-val ticker-val" id="pe-live-price">₹0.00</span>
+                    </div>
+                    <div class="opt-details-grid">
+                        <div class="opt-det-item"><span>Day High (X)</span><span id="pe-day-high">-</span></div>
+                        <div class="opt-det-item"><span>Entry Target</span><span id="pe-entry-ord">-</span></div>
+                        <div class="opt-det-item"><span>Stop Loss</span><span id="pe-sl">-</span></div>
+                        <div class="opt-det-item"><span>Target</span><span id="pe-target">-</span></div>
+                        <div class="opt-det-item"><span>Re-entries</span><span id="pe-reentries">-</span></div>
+                        <div class="opt-det-item"><span>Position</span><span id="pe-pos" class="badge">None</span></div>
+                    </div>
+                </div>
+
+                <!-- CE Option Contract Card -->
+                <div class="option-ticker-card" id="ce-ticker-card">
+                    <div class="opt-card-header">
+                        <span class="badge badge-ce">Call Option (CE)</span>
+                        <span class="opt-strike-label" id="ce-strike-lbl">Strike: -</span>
+                    </div>
+                    <div class="opt-price-row">
+                        <span class="opt-live-lbl">Live Premium</span>
+                        <span class="opt-live-val ticker-val" id="ce-live-price">₹0.00</span>
+                    </div>
+                    <div class="opt-details-grid">
+                        <div class="opt-det-item"><span>Day High (X)</span><span id="ce-day-high">-</span></div>
+                        <div class="opt-det-item"><span>Entry Target</span><span id="ce-entry-ord">-</span></div>
+                        <div class="opt-det-item"><span>Stop Loss</span><span id="ce-sl">-</span></div>
+                        <div class="opt-det-item"><span>Target</span><span id="ce-target">-</span></div>
+                        <div class="opt-det-item"><span>Re-entries</span><span id="ce-reentries">-</span></div>
+                        <div class="opt-det-item"><span>Position</span><span id="ce-pos" class="badge">None</span></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Active Trade Positions Panel -->
+            <section class="active-positions-container" id="active-positions-panel">
+                <div class="active-positions-header">
+                    <h3><i class="fa-solid fa-folder-open" style="color: #10B981; margin-right: 8px;"></i> Active Trade Positions</h3>
+                    <p>Current open options positions in the live market.</p>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Scrip Name</th>
+                                <th>Entry Time</th>
+                                <th>Qty / Lots</th>
+                                <th>Entry Price</th>
+                                <th>CMP</th>
+                                <th>Stop Loss</th>
+                                <th>Target</th>
+                                <th style="text-align: right;">Unrealized PnL</th>
+                            </tr>
+                        </thead>
+                        <tbody id="active-positions-tbody">
+                            <tr>
+                                <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px; font-style: italic;">
+                                    No active positions. Open trades will appear here during live market hours.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <!-- Margin Safety & Recommendations Bar -->
+                <div id="active-positions-margin-bar"></div>
+            </section>
+
+            <!-- Real-Time Chart & Terminal Console -->
+            <section class="live-charts-logs">
+                <!-- Real-time ticks chart -->
+                <div class="live-chart-container">
+                    <div class="chart-header">
+                        <h3><i class="fa-solid fa-chart-line"></i> Live Option Premium Chart</h3>
+                        <p class="chart-subtitle">Real-time contract ticks from options chain feed.</p>
+                    </div>
+                    <div class="live-chart-canvas">
+                        <canvas id="live-premium-chart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Terminal logs console -->
+                <div class="terminal-log-container">
+                    <div class="terminal-header">
+                        <span><i class="fa-solid fa-terminal"></i> Bot Execution Log Console</span>
+                        <span class="terminal-status" id="terminal-pulse">SYS OK</span>
+                    </div>
+                    <div class="terminal-body" id="terminal-body-log">
+                        <div class="terminal-line system-msg">>> SYSTEM: Live Trading Console Initialized. Configure settings and start the engine.</div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Completed Paper Trades Log Modal -->
+    <div id="trade-log-modal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 style="margin: 0; font-family: 'Outfit', sans-serif; display: flex; align-items: center; gap: 10px;">
+                    <i class="fa-solid fa-list-check" style="color: #6366F1;"></i> Completed Paper Trades Log
+                </h2>
+                <button id="close-modal-btn" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-subtitle" style="color: #9CA3AF; margin-bottom: 20px; font-size: 13px; font-family: 'Inter', sans-serif;">
+                    This log lists all completed paper trades grouped date-wise. Put Option (PE) and Call Option (CE) legs are separated side-by-side.
+                </p>
+                <div id="modal-trade-list-container" style="max-height: 60vh; overflow-y: auto; padding-right: 5px;">
+                    <!-- Date groups will be dynamically generated by JS -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Zerodha TOTP Prompt Modal -->
+    <div id="totp-modal" class="modal-overlay">
+        <div class="modal-content" style="max-width: 400px; text-align: center;">
+            <div class="modal-header" style="justify-content: center;">
+                <h2 style="margin: 0; font-family: 'Outfit', sans-serif; display: flex; align-items: center; gap: 10px;">
+                    <i class="fa-solid fa-key" style="color: #F59E0B;"></i> Zerodha 2FA TOTP
+                </h2>
+            </div>
+            <div class="modal-body" style="padding: 24px;">
+                <p style="color: #9CA3AF; margin-bottom: 20px; font-size: 13px; font-family: 'Inter', sans-serif;" id="totp-prompt-message">
+                    Please enter the 6-digit TOTP code from your Google Authenticator or Kite app.
+                </p>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <input type="text" id="totp-code-input" class="terminal-input" placeholder="e.g. 123456" maxlength="6" style="text-align: center; font-size: 24px; letter-spacing: 8px; font-family: 'Fira Code', monospace; padding: 10px; width: 100%; box-sizing: border-box; background: #07090E; border: 1px solid var(--border-terminal); color: #10B981; border-radius: 4px;">
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: center;">
+                    <button type="button" id="submit-totp-btn" class="btn btn-start" style="flex: 1; padding: 10px; background: #F59E0B; border-color: #F59E0B; box-shadow: 0 4px 12px rgba(245, 158, 11, 0.2);"><i class="fa-solid fa-check"></i> Submit Code</button>
+                    <button type="button" id="cancel-totp-btn" class="btn btn-stop" style="flex: 1; padding: 10px;"><i class="fa-solid fa-xmark"></i> Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Real Money Safety Confirmation Modal -->
+    <div id="real-money-confirm-modal" class="modal-overlay">
+        <div class="modal-content" style="max-width: 480px; text-align: center; border: 1px solid #EF4444; box-shadow: 0 0 25px rgba(239, 68, 68, 0.35);">
+            <div class="modal-header" style="justify-content: center; border-bottom: 1px solid rgba(239, 68, 68, 0.3);">
+                <h2 style="margin: 0; font-family: 'Outfit', sans-serif; display: flex; align-items: center; gap: 10px; color: #EF4444;">
+                    <i class="fa-solid fa-triangle-exclamation"></i> REAL MONEY LIVE TRADING
+                </h2>
+            </div>
+            <div class="modal-body" style="padding: 24px;">
+                <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 14px; margin-bottom: 18px; text-align: left;">
+                    <p style="color: #FCA5A5; margin: 0; font-size: 13px; font-weight: 600; line-height: 1.5;">
+                        ⚠️ WARNING: You are switching to LIVE REAL MONEY execution.
+                    </p>
+                    <ul style="color: #E5E7EB; font-size: 12px; margin: 8px 0 0 16px; padding: 0; line-height: 1.6;">
+                        <li>Orders will be placed <strong>directly on your Zerodha trading account</strong>.</li>
+                        <li>Real capital (₹5,00,000) will be utilized for margin and short option legs.</li>
+                        <li>Hard exchange-level SL-L orders and automatic square-off at 15:15 IST are active.</li>
+                    </ul>
+                </div>
+                <p style="color: #9CA3AF; margin-bottom: 20px; font-size: 13px;">
+                    Are you completely sure you want to enable Real Money Live Trading?
+                </p>
+                <div style="display: flex; gap: 12px; justify-content: center;">
+                    <button type="button" id="confirm-real-money-btn" class="btn btn-start" style="flex: 1; padding: 12px; background: linear-gradient(135deg, #DC2626, #991B1B); border-color: #EF4444; color: white; font-weight: 700; box-shadow: 0 4px 12px rgba(220, 38, 38, 0.4);">
+                        <i class="fa-solid fa-bolt"></i> Enable Real Money
+                    </button>
+                    <button type="button" id="cancel-real-money-btn" class="btn btn-stop" style="flex: 1; padding: 12px; background: #374151; border-color: #4B5563; color: white;">
+                        <i class="fa-solid fa-xmark"></i> Keep Paper Mode
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main JavaScript App -->
+    <script src="{{ url_for('static', filename='js/live.js') }}?v=12.0"></script>
+</body>
+</html>

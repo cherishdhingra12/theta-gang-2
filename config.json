@@ -1,0 +1,14 @@
+{
+  "auto_pilot": true,
+  "mode": "LIVE",
+  "capital": 500000.0,
+  "strategy_type": "BOTH",
+  "strike_offset_pe": 100,
+  "strike_offset_ce": -100,
+  "entry_discount": 10.0,
+  "lot_1_target": 40.0,
+  "max_reentries": 5,
+  "lot_size": 65,
+  "iv": 11.5,
+  "r": 7.0
+}

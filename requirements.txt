@@ -1,0 +1,8 @@
+flask
+pandas
+numpy
+pytz
+yfinance
+playwright
+kiteconnect
+requests

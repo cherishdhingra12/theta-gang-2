@@ -1,0 +1,21 @@
+# Environment & credentials
+.env
+.env.*
+!.env.example
+
+# Local runtime states & logs
+scratch/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+*.tar.gz
+live_trades.json
+live_state.json*
+
+# Internal memory docs & audit certifications (contain personal account info)
+*_memory.md
+pre_flight_*.md
+
+# Virtual environment
+venv/

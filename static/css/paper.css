@@ -1,0 +1,342 @@
+/* Cyberpunk / Live Terminal Accent Styling */
+:root {
+    --bg-terminal: #0B0E14;
+    --border-terminal: #1B2433;
+    --text-terminal: #22C55E; /* Terminal Green */
+    --color-gold: #F59E0B;
+}
+
+/* Nav Links */
+.nav-links {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 24px;
+}
+
+.nav-item {
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    text-decoration: none;
+    transition: all 0.2s ease;
+}
+
+.nav-item:hover {
+    background-color: var(--bg-card);
+    color: var(--text-primary);
+}
+
+.nav-item.active {
+    background-color: var(--color-primary-glow);
+    color: var(--color-primary);
+    border: 1px solid var(--border-color);
+}
+
+/* Speed Slider Styling */
+.speed-slider-container {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.speed-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border-color);
+    outline: none;
+}
+
+.speed-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--color-primary);
+    cursor: pointer;
+    box-shadow: 0 0 8px var(--color-primary);
+    transition: transform 0.1s;
+}
+
+.speed-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+
+/* Control Buttons States */
+.control-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 10px;
+}
+
+.btn-start {
+    background: linear-gradient(135deg, #10B981, #059669);
+    color: #FFF;
+    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);
+}
+.btn-start:hover:not(.disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(16, 185, 129, 0.35);
+}
+
+.btn-pause {
+    background: linear-gradient(135deg, #F59E0B, #D97706);
+    color: #FFF;
+    box-shadow: 0 4px 12px rgba(245, 158, 11, 0.2);
+}
+.btn-pause:hover:not(.disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(245, 158, 11, 0.35);
+}
+
+.btn-stop {
+    background: linear-gradient(135deg, #EF4444, #DC2626);
+    color: #FFF;
+    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.2);
+}
+.btn-stop:hover:not(.disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(239, 68, 68, 0.35);
+}
+
+.btn.disabled {
+    background: rgba(34, 43, 62, 0.4) !important;
+    border: 1px solid var(--border-color) !important;
+    color: var(--text-muted) !important;
+    cursor: not-allowed;
+    box-shadow: none !important;
+    transform: none !important;
+}
+
+/* Account Ticker Bar */
+.live-accounts-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 20px;
+    margin-bottom: 24px;
+}
+
+.live-acc-card {
+    background-color: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.live-acc-title {
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.live-acc-value {
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 700;
+}
+
+/* Tickers Panels */
+.tickers-panel {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 24px;
+}
+
+.option-ticker-card {
+    background-color: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    transition: all 0.2s ease;
+}
+
+.opt-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+
+.opt-strike-label {
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.opt-price-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 16px;
+    margin-bottom: 16px;
+}
+
+.opt-live-lbl {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.opt-live-val {
+    font-family: var(--font-display);
+    font-size: 32px;
+    font-weight: 800;
+    line-height: 1;
+}
+
+.opt-details-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 20px;
+}
+
+.opt-det-item {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+.opt-det-item span:first-child {
+    color: var(--text-muted);
+}
+
+.opt-det-item span:last-child {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Real-Time Price Flashes */
+.ticker-val {
+    transition: color 0.15s ease-out;
+}
+
+.flash-up {
+    animation: flashGreen 0.6s ease-out;
+}
+
+.flash-down {
+    animation: flashRed 0.6s ease-out;
+}
+
+@keyframes flashGreen {
+    0% { color: var(--color-success); text-shadow: 0 0 10px var(--color-success-glow); }
+    100% { color: inherit; text-shadow: none; }
+}
+
+@keyframes flashRed {
+    0% { color: var(--color-danger); text-shadow: 0 0 10px var(--color-danger-glow); }
+    100% { color: inherit; text-shadow: none; }
+}
+
+/* Live Charts and Log Console Row */
+.live-charts-logs {
+    display: grid;
+    grid-template-columns: 1.2fr 0.8fr;
+    gap: 20px;
+    margin-bottom: 24px;
+}
+
+.live-chart-container {
+    background-color: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 24px;
+}
+
+.live-chart-canvas {
+    height: 280px;
+    position: relative;
+}
+
+/* Terminal log styling */
+.terminal-log-container {
+    background-color: var(--bg-terminal);
+    border: 1px solid var(--border-terminal);
+    border-radius: var(--radius-lg);
+    display: flex;
+    flex-direction: column;
+    height: 360px;
+    overflow: hidden;
+    box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.6);
+}
+
+.terminal-header {
+    background-color: #121824;
+    border-bottom: 1px solid var(--border-terminal);
+    padding: 10px 16px;
+    font-family: 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.terminal-status {
+    color: var(--text-terminal);
+    font-weight: 600;
+    text-shadow: 0 0 5px rgba(34, 197, 94, 0.4);
+}
+
+.terminal-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    font-family: 'Fira Code', monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.terminal-line {
+    word-break: break-all;
+}
+
+.system-msg {
+    color: #60A5FA; /* System Blue */
+}
+
+.order-msg {
+    color: var(--color-gold); /* Order Amber */
+}
+
+.fill-msg {
+    color: var(--text-terminal); /* Fill Green */
+    font-weight: 600;
+}
+
+.exit-msg {
+    color: #F87171; /* Exit Red */
+    font-weight: 600;
+}
+
+.trail-msg {
+    color: #A78BFA; /* Trailing Purple */
+}
+
+.status-stopped-dot { background-color: var(--color-danger) !important; box-shadow: 0 0 8px var(--color-danger) !important; }
+.status-paused-dot { background-color: var(--color-warning) !important; box-shadow: 0 0 8px var(--color-warning) !important; }
+.status-running-dot { background-color: var(--color-success) !important; box-shadow: 0 0 8px var(--color-success) !important; }
+
+.terminal-glow {
+    text-shadow: 0 0 8px var(--color-primary-glow);
+}

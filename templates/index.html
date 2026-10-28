@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Theta Gang 2 — Options Backtesting Dashboard</title>
+    <!-- Google Fonts: Fira Code, Outfit, Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Main Stylesheet -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=12.0">
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar: Controls & Inputs -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fa-solid fa-bolt logo-icon"></i>
+                    <span>Theta<span class="logo-accent">Gang 2</span></span>
+                </div>
+                <p class="sidebar-subtitle">Theta Gang 2 Backtester</p>
+            </div>
+
+            <!-- Navigation Links -->
+            <div class="nav-links">
+                <a href="/" class="nav-item active"><i class="fa-solid fa-chart-area"></i> Historical Backtester</a>
+                <a href="/paper" class="nav-item"><i class="fa-solid fa-terminal"></i> Playback Simulator</a>
+                <a href="/live" class="nav-item"><i class="fa-solid fa-tower-broadcast"></i> Live Trading Console</a>
+            </div>
+            
+            <form id="config-form" class="sidebar-form">
+                <!-- Data Source Selection -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-database"></i> Data Source</h3>
+                    <div class="form-group">
+                        <label for="data-source-select">Mode</label>
+                        <select id="data-source-select">
+                            <option value="simulated">Simulated Options (Black-Scholes)</option>
+                            <option value="csv">Upload Historical CSV</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Simulated Option Parameters -->
+                <div id="simulated-params" class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-sliders"></i> Market Settings</h3>
+                    <div class="form-group">
+                        <label for="symbol">Symbol</label>
+                        <select id="symbol" name="symbol">
+                            <option value="^NSEI">NIFTY 50 Index (^NSEI)</option>
+                            <option value="^NSEBANK">BANK NIFTY (^NSEBANK)</option>
+                            <option value="RELIANCE.NS">RELIANCE (Reliance Industries)</option>
+                            <option value="TCS.NS">TCS (Tata Consultancy Services)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="period">Date Range (Yahoo Finance)</label>
+                        <select id="period" name="period">
+                            <option value="7d">Last 7 Days (1m data)</option>
+                            <option value="15d">Last 15 Days (1m data)</option>
+                            <option value="1mo" selected>Last 1 Month (1m data)</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="iv">Implied Vol (IV %)</label>
+                            <input type="number" id="iv" name="iv" value="15" min="5" max="100" step="1">
+                        </div>
+                        <div class="form-group half">
+                            <label for="r">Risk-Free Rate (%)</label>
+                            <input type="number" id="r" name="r" value="7" min="0" max="20" step="0.5">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Custom CSV Upload Parameters -->
+                <div id="csv-params" class="form-section hidden">
+                    <h3 class="section-title"><i class="fa-solid fa-file-csv"></i> CSV Upload</h3>
+                    <div class="form-group">
+                        <label for="csv-file">Choose Option/Spot CSV</label>
+                        <input type="file" id="csv-file" accept=".csv" class="file-input">
+                        <p class="file-help">Must contain: Datetime, Open, High, Low, Close (1-minute intervals).</p>
+                    </div>
+                </div>
+
+                <!-- Strategy Core Parameters -->
+                <div class="form-section">
+                    <h3 class="section-title"><i class="fa-solid fa-gears"></i> Strategy Parameters</h3>
+                    
+                    <div class="form-group">
+                        <label for="strategy_type">Strategy Type</label>
+                        <select id="strategy_type" name="strategy_type">
+                            <option value="BOTH">Short Strangle (PE + CE Sell)</option>
+                            <option value="PE_SELL">Put Option Only (PE Sell)</option>
+                            <option value="CE_SELL">Call Option Only (CE Sell)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="strike_offset_pe">PE Strike Offset</label>
+                            <input type="number" id="strike_offset_pe" name="strike_offset_pe" value="100" step="50" placeholder="+100">
+                        </div>
+                        <div class="form-group half">
+                            <label for="strike_offset_ce">CE Strike Offset</label>
+                            <input type="number" id="strike_offset_ce" name="strike_offset_ce" value="-100" step="50" placeholder="-100">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="entry_discount">Entry Discount (%)</label>
+                            <div class="input-with-hint">
+                                <input type="number" id="entry_discount" name="entry_discount" value="10" min="1" max="50" step="1">
+                                <span class="hint">below Day High</span>
+                            </div>
+                        </div>
+                        <div class="form-group half">
+                            <label for="lot_1_target">Lot 1 Target (%)</label>
+                            <div class="input-with-hint">
+                                <input type="number" id="lot_1_target" name="lot_1_target" value="40" min="5" max="95" step="1">
+                                <span class="hint">below Day High</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="max_reentries">Max Entries / Day</label>
+                            <input type="number" id="max_reentries" name="max_reentries" value="5" min="1" max="10" step="1">
+                        </div>
+                        <div class="form-group half">
+                            <label for="lot_size">Lot Size</label>
+                            <input type="number" id="lot_size" name="lot_size" value="65" min="1" step="1">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="capital">Starting Capital (₹)</label>
+                            <input type="number" id="capital" name="capital" value="500000" min="50000" step="10000">
+                        </div>
+                        <div class="form-group half">
+                            <label>Square-off Time</label>
+                            <input type="text" value="15:15 IST" disabled class="disabled-input">
+                        </div>
+                    </div>
+                </div>
+
+                <button type="submit" id="run-backtest-btn" class="btn btn-primary">
+                    <span class="btn-text">Run Backtest</span>
+                    <i class="fa-solid fa-play btn-icon"></i>
+                </button>
+            </form>
+        </aside>
+
+        <!-- Main Workspace Area -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="main-header">
+                <div class="header-left">
+                    <h1>Performance Analytics</h1>
+                    <p class="header-subtitle" id="active-backtest-summary">Select settings and click Run Backtest to view results.</p>
+                </div>
+                <div class="header-right">
+                    <div class="status-badge" id="status-indicator">
+                        <span class="pulse-dot"></span>
+                        <span id="status-text">Ready</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Metrics Cards Grid -->
+            <section class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-header">
+                        <span class="metric-title">Net PnL</span>
+                        <i class="fa-solid fa-wallet metric-icon color-indigo"></i>
+                    </div>
+                    <div class="metric-value" id="metric-pnl">₹0.00</div>
+                    <div class="metric-sub" id="metric-rom">0.0% Return on capital</div>
+                </div>
+
+                <div class="metric-card">
+                    <div class="metric-header">
+                        <span class="metric-title">Win Rate (Days)</span>
+                        <i class="fa-solid fa-trophy metric-icon color-gold"></i>
+                    </div>
+                    <div class="metric-value" id="metric-winrate">0.0%</div>
+                    <div class="metric-sub" id="metric-winloss-ratio">0 Wins / 0 Losses</div>
+                </div>
+
+                <div class="metric-card">
+                    <div class="metric-header">
+                        <span class="metric-title">Total Trades</span>
+                        <i class="fa-solid fa-handshake metric-icon color-blue"></i>
+                    </div>
+                    <div class="metric-value" id="metric-trades">0</div>
+                    <div class="metric-sub" id="metric-avg-trades">0.0 Avg trades/day</div>
+                </div>
+
+                <div class="metric-card">
+                    <div class="metric-header">
+                        <span class="metric-title">Max Drawdown</span>
+                        <i class="fa-solid fa-chart-line-down metric-icon color-red"></i>
+                    </div>
+                    <div class="metric-value color-danger" id="metric-drawdown">0.0%</div>
+                    <div class="metric-sub" id="metric-drawdown-amount">₹0.00 Max dip</div>
+                </div>
+
+                <div class="metric-card">
+                    <div class="metric-header">
+                        <span class="metric-title">Profit Factor</span>
+                        <i class="fa-solid fa-scale-balanced metric-icon color-emerald"></i>
+                    </div>
+                    <div class="metric-value" id="metric-profit-factor">0.0</div>
+                    <div class="metric-sub" id="metric-pnl-ratio">Gross Profit/Gross Loss</div>
+                </div>
+            </section>
+
+            <!-- Charts Section -->
+            <section class="charts-section">
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <h3><i class="fa-solid fa-chart-area"></i> Equity Growth Curve (Net PnL)</h3>
+                        <p class="chart-subtitle">Real-time cumulative performance including simulated slippage and margin constraints.</p>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="equity-chart"></canvas>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Trade Log Table Section -->
+            <section class="log-section">
+                <div class="log-card">
+                    <div class="log-header">
+                        <div class="log-title-area">
+                            <h3><i class="fa-solid fa-list-check"></i> Executed Trade History Log</h3>
+                            <p class="chart-subtitle">Detailed transactional history of option entries, targets, stop-losses, and re-entries.</p>
+                        </div>
+                        <div class="log-actions">
+                            <div class="search-box">
+                                <i class="fa-solid fa-magnifying-glass search-icon"></i>
+                                <input type="text" id="trade-search" placeholder="Filter by Type, Reason, Date...">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table id="trade-log-table">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Option Type</th>
+                                    <th>Strike</th>
+                                    <th>Entry Price</th>
+                                    <th>Entry Time</th>
+                                    <th>Exit Price</th>
+                                    <th>Exit Time</th>
+                                    <th>Lots</th>
+                                    <th>PnL (₹)</th>
+                                    <th>Exit Reason</th>
+                                    <th>Re-entry #</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trade-log-tbody">
+                                <tr>
+                                    <td colspan="11" class="no-data">No data available. Run a backtest to see the logs.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="spinner-container">
+            <div class="spinner"></div>
+            <p class="loading-message">Fetching market data and running simulation...</p>
+        </div>
+    </div>
+
+    <!-- Main JavaScript App -->
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
