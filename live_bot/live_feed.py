@@ -289,6 +289,11 @@ class LiveManager:
         self.spot_token = None
         self.last_websocket_tick_time = None
         self.circuit_breaker_tripped = False
+        self._cached_broker_margins = None
+        self._cached_broker_margins_time = 0.0
+        self._cached_calculated_margins = None
+        self._cached_calculated_margins_time = 0.0
+        self._cached_calculated_margins_key = None
 
     def place_zerodha_order(self, symbol, transaction_type, quantity, order_type="MARKET", trigger_price=0.0, price=0.0):
         """
@@ -865,6 +870,9 @@ class LiveManager:
     def get_live_broker_margins(self):
         if not self.kite:
             return None
+        now_ts = time.time()
+        if self._cached_broker_margins and (now_ts - self._cached_broker_margins_time < 60.0):
+            return self._cached_broker_margins
         try:
             m = self.kite.margins("equity")
             avail = m.get("available", {})
@@ -872,11 +880,16 @@ class LiveManager:
             
             cash = float(avail.get("live_balance") or avail.get("cash") or 0.0)
             used = float(utilised.get("debits") or (float(utilised.get("span", 0)) + float(utilised.get("exposure", 0))))
-            return {
+            res = {
                 "available": cash,
                 "utilised": used
             }
+            self._cached_broker_margins = res
+            self._cached_broker_margins_time = now_ts
+            return res
         except Exception as e:
+            if self._cached_broker_margins:
+                return self._cached_broker_margins
             print(f"Error fetching live account margins: {e}")
             return None
 
@@ -888,6 +901,13 @@ class LiveManager:
         if (not pe_pos or pe_pos == 'None') and (not ce_pos or ce_pos == 'None'):
             return 0.0, 0.0
             
+        now_ts = time.time()
+        cache_key = (pe_pos, ce_pos, self.strategy_state['PE']['strike'], self.strategy_state['CE']['strike'])
+        if (self._cached_calculated_margins and 
+            self._cached_calculated_margins_key == cache_key and 
+            (now_ts - self._cached_calculated_margins_time < 60.0)):
+            return self._cached_calculated_margins
+
         lot_size = self.lot_size
         
         # If Kite is active, try to fetch real-time margins from Zerodha API
@@ -944,7 +964,11 @@ class LiveManager:
                     res = self.kite.basket_order_margins(params)
                     margin_required = res.get("initial", {}).get("total", 0.0)
                     if margin_required > 0:
-                        return round(margin_required, 2), round(margin_required * 1.20, 2)
+                        margin_res = (round(margin_required, 2), round(margin_required * 1.20, 2))
+                        self._cached_calculated_margins = margin_res
+                        self._cached_calculated_margins_time = now_ts
+                        self._cached_calculated_margins_key = cache_key
+                        return margin_res
             except Exception as e:
                 print(f"Error fetching margins from Zerodha API: {e}. Using fallback calculation.")
                 
@@ -967,7 +991,11 @@ class LiveManager:
         else:
             margin_required = total_lots * 100000.0
             
-        return round(margin_required, 2), round(margin_required * 1.20, 2)
+        margin_res = (round(margin_required, 2), round(margin_required * 1.20, 2))
+        self._cached_calculated_margins = margin_res
+        self._cached_calculated_margins_time = now_ts
+        self._cached_calculated_margins_key = cache_key
+        return margin_res
 
     def start(self, mode, capital, strategy_type, strike_offset_pe, strike_offset_ce, 
               entry_discount, lot_1_target, max_reentries, lot_size, iv, r):
