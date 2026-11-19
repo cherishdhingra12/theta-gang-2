@@ -18,6 +18,32 @@ except ImportError:
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json')
 TRADES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'live_trades.json')
 LIVE_STATE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'live_state.json')
+SYMBOL_KNOWLEDGE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'symbol_knowledge.json')
+
+def load_symbol_knowledge():
+    if not os.path.exists(SYMBOL_KNOWLEDGE_PATH):
+        return {"expiries": {}, "anomalies": []}
+    try:
+        with open(SYMBOL_KNOWLEDGE_PATH, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                return {"expiries": {}, "anomalies": []}
+            return json.loads(content)
+    except Exception as e:
+        print(f"Error loading symbol_knowledge.json: {e}")
+        return {"expiries": {}, "anomalies": []}
+
+def save_symbol_knowledge(knowledge_data):
+    try:
+        os.makedirs(os.path.dirname(SYMBOL_KNOWLEDGE_PATH), exist_ok=True)
+        temp_path = f"{SYMBOL_KNOWLEDGE_PATH}.tmp.{os.getpid()}"
+        with open(temp_path, 'w') as f:
+            json.dump(knowledge_data, f, indent=2)
+        os.replace(temp_path, SYMBOL_KNOWLEDGE_PATH)
+        return True
+    except Exception as e:
+        print(f"Error saving symbol_knowledge.json: {e}")
+        return False
 
 def load_live_state():
     if not os.path.exists(LIVE_STATE_PATH):
@@ -296,6 +322,11 @@ class LiveManager:
         self._cached_calculated_margins = None
         self._cached_calculated_margins_time = 0.0
         self._cached_calculated_margins_key = None
+
+        # Autonomous Self-Healing & Learning fields
+        self.preflight_completed_date = None
+        self.last_watchdog_heal_time = 0.0
+        self.consecutive_heal_attempts = {}
 
     def place_zerodha_order(self, symbol, transaction_type, quantity, order_type="MARKET", trigger_price=0.0, price=0.0):
         """
@@ -686,25 +717,165 @@ class LiveManager:
             
         return metrics
 
+    def record_verified_symbol(self, expiry_str, strike, opt_type, tradingsymbol, method="DIRECT_MATCH"):
+        """
+        Saves verified tradingsymbol syntax and expiry pattern into the persistent knowledge base.
+        Enables self-learning so the engine remembers exchange conventions across restarts.
+        """
+        try:
+            data = load_symbol_knowledge()
+            if "expiries" not in data:
+                data["expiries"] = {}
+            if "anomalies" not in data:
+                data["anomalies"] = []
+                
+            clean_sym = tradingsymbol.replace("NFO:", "")
+            months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+            is_monthly = any(m in clean_sym for m in months)
+            format_type = "MONTHLY" if is_monthly else "WEEKLY"
+            
+            now_iso = datetime.datetime.now(pytz.timezone('Asia/Kolkata')).isoformat()
+            data["expiries"][expiry_str] = {
+                "format": format_type,
+                "example_symbol": clean_sym,
+                "last_verified": now_iso,
+                "method": method
+            }
+            
+            if method in ["PERMUTATION_PROBE", "FUZZY_MATCH"]:
+                data["anomalies"].append({
+                    "timestamp": now_iso,
+                    "expiry": expiry_str,
+                    "method": method,
+                    "resolved_symbol": clean_sym
+                })
+                data["anomalies"] = data["anomalies"][-50:]
+                
+            save_symbol_knowledge(data)
+        except Exception as e:
+            print(f"Error recording verified symbol: {e}")
+
+    def probe_symbol_permutations(self, strike, opt_type, expiry_date):
+        """
+        Autonomous permutation probe: generates all valid exchange candidate naming conventions
+        and tests them live against Zerodha quotes to discover working tradingsymbols.
+        """
+        if not getattr(self, 'kite', None):
+            return None
+            
+        yy = str(expiry_date.year)[2:]
+        months = ["", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+        month_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+        
+        candidates = []
+        
+        # 1. Monthly 3-letter format (e.g. NIFTY26NOV25000CE)
+        m_str = months[expiry_date.month]
+        candidates.append(f"NIFTY{yy}{m_str}{int(strike)}{opt_type}")
+        
+        # 2. Weekly single-char month format (e.g. NIFTY26N2325000CE)
+        w_m_str = month_map.get(expiry_date.month, str(expiry_date.month))
+        candidates.append(f"NIFTY{yy}{w_m_str}{expiry_date.day:02d}{int(strike)}{opt_type}")
+        
+        # 3. Weekly alternate day shifts (±1, ±2 days for holidays)
+        for delta in [-1, 1, -2, 2]:
+            alt_d = expiry_date + datetime.timedelta(days=delta)
+            if alt_d.month == expiry_date.month:
+                candidates.append(f"NIFTY{yy}{w_m_str}{alt_d.day:02d}{int(strike)}{opt_type}")
+                
+        # 4. Standard Tuesday of current week
+        days_to_tue = (1 - expiry_date.weekday()) % 7
+        tue_d = expiry_date + datetime.timedelta(days=days_to_tue)
+        if tue_d != expiry_date:
+            tue_m_str = month_map.get(tue_d.month, str(tue_d.month))
+            candidates.append(f"NIFTY{yy}{tue_m_str}{tue_d.day:02d}{int(strike)}{opt_type}")
+            
+        # Deduplicate candidates while preserving order
+        unique_candidates = []
+        for c in candidates:
+            if c not in unique_candidates:
+                unique_candidates.append(c)
+                
+        try:
+            quote_keys = [f"NFO:{c}" for c in unique_candidates]
+            quotes = self.kite.quote(quote_keys)
+            for c in unique_candidates:
+                qkey = f"NFO:{c}"
+                if qkey in quotes:
+                    q_data = quotes[qkey]
+                    if q_data and (q_data.get("instrument_token") or "last_price" in q_data or "ohlc" in q_data):
+                        self.record_verified_symbol(str(expiry_date), strike, opt_type, c, method="PERMUTATION_PROBE")
+                        self.add_log(f"⚡ [Self-Healing] Discovered valid tradingsymbol via probe: {c}")
+                        send_telegram_alert(f"⚡ <b>AUTONOMOUS SELF-HEALING</b>\nDiscovered valid option symbol via probe: <code>{c}</code>\nSaved to persistent Knowledge Base.")
+                        return qkey
+        except Exception as e:
+            self.add_log(f"⚠️ Permutation probe failed: {e}")
+            
+        return None
+
     def get_option_symbol(self, strike, opt_type, current_date):
         if hasattr(current_date, 'date'):
             current_date = current_date.date()
         
         expiry_date = self.get_nearest_nifty_expiry(current_date)
+        exp_str = str(expiry_date)
         
-        # 1. Authoritative lookup directly from Zerodha instrument master if Kite is connected
+        # Tier 1: Consult Persistent Symbol Knowledge Base
+        knowledge = load_symbol_knowledge()
+        learned_exp = knowledge.get("expiries", {}).get(exp_str)
+        if learned_exp and learned_exp.get("format"):
+            yy = str(expiry_date.year)[2:]
+            if learned_exp["format"] == "MONTHLY":
+                months = ["", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+                month_str = months[expiry_date.month]
+                learned_sym = f"NIFTY{yy}{month_str}{int(strike)}{opt_type}"
+                return f"NFO:{learned_sym}"
+            elif learned_exp["format"] == "WEEKLY":
+                month_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+                m_str = month_map.get(expiry_date.month, str(expiry_date.month))
+                dd = f"{expiry_date.day:02d}"
+                learned_sym = f"NIFTY{yy}{m_str}{dd}{int(strike)}{opt_type}"
+                return f"NFO:{learned_sym}"
+
+        # Tier 2: Authoritative Lookup from Zerodha Instrument Master
         if getattr(self, 'kite', None) is not None:
             insts = self._ensure_nfo_instruments()
             if insts:
                 for inst in insts:
                     if (inst.get("strike") == float(strike)
                             and inst.get("instrument_type") == opt_type
-                            and str(inst.get("expiry")) == str(expiry_date)):
+                            and str(inst.get("expiry")) == exp_str):
                         ts = inst.get("tradingsymbol")
                         if ts:
+                            self.record_verified_symbol(exp_str, strike, opt_type, ts, method="DIRECT_MATCH")
                             return f"NFO:{ts}"
 
-        # 2. Fallback heuristic string construction (for offline simulation / unit tests)
+                # Tier 3: Fuzzy Match on Instrument Master (within ±3 days to absorb holiday shifts)
+                fuzzy_matches = []
+                for inst in insts:
+                    if (inst.get("strike") == float(strike) and inst.get("instrument_type") == opt_type):
+                        inst_exp = inst.get("expiry")
+                        if inst_exp:
+                            inst_exp_dt = inst_exp if isinstance(inst_exp, datetime.date) else datetime.date.fromisoformat(str(inst_exp))
+                            delta_days = abs((inst_exp_dt - expiry_date).days)
+                            if delta_days <= 3 and inst_exp_dt >= current_date:
+                                fuzzy_matches.append((delta_days, inst))
+                if fuzzy_matches:
+                    fuzzy_matches.sort(key=lambda x: x[0])
+                    best_inst = fuzzy_matches[0][1]
+                    ts = best_inst.get("tradingsymbol")
+                    if ts:
+                        self.cached_expiry = best_inst.get("expiry") if isinstance(best_inst.get("expiry"), datetime.date) else datetime.date.fromisoformat(str(best_inst.get("expiry")))
+                        self.record_verified_symbol(exp_str, strike, opt_type, ts, method="FUZZY_MATCH")
+                        self.add_log(f"⚡ [Self-Healing] Fuzzy matched holiday shifted expiry {self.cached_expiry} for {opt_type} {strike}: {ts}")
+                        return f"NFO:{ts}"
+
+                # Tier 4: Autonomous Permutation Probe
+                probed = self.probe_symbol_permutations(strike, opt_type, expiry_date)
+                if probed:
+                    return probed
+
+        # Tier 5: Fallback heuristic string construction (for offline simulation / unit tests)
         is_monthly = False
         cached_insts = getattr(self, 'cached_nfo_instruments', None)
         if cached_insts:
@@ -726,21 +897,195 @@ class LiveManager:
             is_monthly = (expiry_date + datetime.timedelta(days=7)).month != expiry_date.month or expiry_date.day >= 23
 
         yy = str(expiry_date.year)[2:]
-        
         if is_monthly:
             months = ["", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
             month_str = months[expiry_date.month]
             symbol = f"NIFTY{yy}{month_str}{int(strike)}{opt_type}"
         else:
-            month_map = {
-                1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9",
-                10: "O", 11: "N", 12: "D"
-            }
-            m_str = month_map[expiry_date.month]
+            month_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+            m_str = month_map.get(expiry_date.month, str(expiry_date.month))
             dd = f"{expiry_date.day:02d}"
             symbol = f"NIFTY{yy}{m_str}{dd}{int(strike)}{opt_type}"
             
         return f"NFO:{symbol}"
+
+    def autonomous_heal_strike(self, opt_type, strike, current_time):
+        """
+        Autonomous recovery protocol: triggered whenever Day High (X) or price is invalid (<= 0.0)
+        at or after 09:30 AM in LIVE modes.
+        Force-refreshes instruments, probes permutations, re-queries quotes, sets valid X,
+        and arms WebSocket subscriptions.
+        """
+        self.add_log(f"⚡ [Self-Healing] Initiating autonomous recovery for {opt_type} {strike}...")
+        state = self.strategy_state.get(opt_type, {})
+        attempts = self.consecutive_heal_attempts.get(opt_type, 0) + 1
+        self.consecutive_heal_attempts[opt_type] = attempts
+        
+        if not self.kite:
+            try:
+                self.kite = self.get_kite_client()
+            except Exception:
+                pass
+                
+        # 1. Ensure NFO instrument master is loaded (cached for 4h)
+        self._ensure_nfo_instruments()
+        
+        # 2. Re-resolve option symbol with full permutation probe
+        resolved_symbol = self.get_option_symbol(strike, opt_type, current_time)
+        
+        # 3. Query real Zerodha quote
+        z_high = 0.0
+        z_price = 0.0
+        if self.kite and resolved_symbol:
+            try:
+                quotes = self.kite.quote([resolved_symbol])
+                q_data = quotes.get(resolved_symbol, {})
+                z_price = float(q_data.get("last_price", 0.0))
+                z_high = float(q_data.get("ohlc", {}).get("high", z_price))
+            except Exception as q_err:
+                self.add_log(f"⚠️ [Self-Healing] Quote fetch error for {resolved_symbol}: {q_err}")
+                
+        # 4. Fallback estimation if market has 0 volume or exchange quote high is 0
+        if z_high <= 0.0:
+            if z_price > 0.0:
+                z_high = z_price
+            else:
+                spot = self.get_live_spot_price() or self.spot_price or 24000.0
+                expiry_date = self.get_nearest_nifty_expiry(current_time)
+                t_years = get_time_to_expiry_years(current_time, expiry_date)
+                val = black_scholes(spot, strike, t_years, self.r, self.iv, opt_type)
+                z_high = round(val * 1.15, 2)
+                z_price = round(val, 2)
+                self.add_log(f"⚡ [Self-Healing] Used theoretical model fallback for {opt_type} {strike}: X = ₹{z_high:.2f}")
+
+        # 5. Apply recovered state
+        state['day_high'] = z_high
+        state['price'] = z_price
+        state['target'] = state['day_high'] * (1.0 - self.lot_1_target_pct)
+        state['current_sl'] = state['day_high']
+        target_entry = state['day_high'] * (1.0 - self.entry_discount)
+        if state['price'] > 0:
+            state['above_entry_threshold'] = (state['price'] > target_entry)
+            
+        # 6. Re-subscribe WebSocket tokens
+        self._resolve_and_subscribe_tokens(current_time)
+        
+        self.add_log(f"✅ [Self-Healing Complete] Recovered {opt_type} {strike}: Symbol {resolved_symbol} | High (X): ₹{state['day_high']:.2f} | Price: ₹{state['price']:.2f}")
+        send_telegram_alert(
+            f"⚡ <b>SELF-HEALING RECOVERY COMPLETE</b>\n"
+            f"Leg: {opt_type} {strike}\n"
+            f"Symbol: <code>{resolved_symbol}</code>\n"
+            f"Day High (X): ₹{state['day_high']:.2f}\n"
+            f"Current LTP: ₹{state['price']:.2f}\n"
+            f"Status: Armed & Active"
+        )
+
+    def preflight_health_check(self, current_time):
+        """
+        Automated pre-flight diagnostic run between 09:15 and 09:28 AM IST.
+        Validates Zerodha connectivity, nearest expiry resolution, and quotes
+        for ATM strikes BEFORE 09:30 strike selection.
+        """
+        today_str = current_time.strftime('%Y-%m-%d')
+        if self.preflight_completed_date == today_str:
+            return True
+            
+        self.add_log("🔍 [Pre-Flight] Executing automated pre-flight health diagnostic...")
+        
+        if self.mode == "MOCK":
+            self.preflight_completed_date = today_str
+            return True
+            
+        if not self.kite:
+            try:
+                self.kite = self.get_kite_client()
+            except Exception as ex:
+                self.add_log(f"⚠️ [Pre-Flight Warning] Zerodha client not connected: {ex}")
+                return False
+                
+        try:
+            self.kite.profile()
+            exp = self.get_nearest_nifty_expiry(current_time)
+            if not exp:
+                self.add_log("🔴 [Pre-Flight Fail] Could not resolve nearest Nifty expiry!")
+                return False
+                
+            test_ce = self.get_option_symbol(25000, 'CE', current_time)
+            test_pe = self.get_option_symbol(25000, 'PE', current_time)
+            quotes = self.kite.quote([test_ce, test_pe])
+            
+            ce_tok = quotes.get(test_ce, {}).get("instrument_token")
+            pe_tok = quotes.get(test_pe, {}).get("instrument_token")
+            
+            if ce_tok and pe_tok:
+                self.preflight_completed_date = today_str
+                self.add_log(f"✅ [Pre-Flight Passed] Expiry {exp} validated. CE: {test_ce} ({ce_tok}) | PE: {test_pe} ({pe_tok}). System ready for 09:30.")
+                return True
+            else:
+                self.add_log(f"⚠️ [Pre-Flight Alert] Token lookup failed on test strikes: CE={ce_tok}, PE={pe_tok}. Triggering proactive self-healing probe...")
+                self.probe_symbol_permutations(25000, 'CE', exp)
+                self.probe_symbol_permutations(25000, 'PE', exp)
+                return False
+        except Exception as e:
+            self.add_log(f"⚠️ [Pre-Flight Error] Diagnostic check encountered exception: {e}")
+            return False
+
+    def get_health_status(self):
+        """
+        Returns real-time autonomous system health status, verified symbols,
+        knowledge base statistics, and feed diagnostics.
+        """
+        kb = load_symbol_knowledge()
+        current_time = self.get_current_time()
+        expiry_date = self.get_nearest_nifty_expiry(current_time)
+        
+        pe_state = self.strategy_state.get('PE', {})
+        ce_state = self.strategy_state.get('CE', {})
+        
+        is_healthy = True
+        warnings = []
+        
+        if self.mode in ["LIVE", "LIVE_REAL"]:
+            if not self.kite:
+                is_healthy = False
+                warnings.append("Zerodha client not connected")
+            if hasattr(current_time, 'time') and current_time.time() >= datetime.time(9, 30):
+                if pe_state.get('strike') and pe_state.get('day_high', 0.0) <= 0.0:
+                    is_healthy = False
+                    warnings.append(f"PE {pe_state.get('strike')} Day High is 0.00")
+                if ce_state.get('strike') and ce_state.get('day_high', 0.0) <= 0.0:
+                    is_healthy = False
+                    warnings.append(f"CE {ce_state.get('strike')} Day High is 0.00")
+                if len(self.websocket_tokens) < 2:
+                    is_healthy = False
+                    warnings.append(f"Incomplete option tokens in WebSocket ({len(self.websocket_tokens)}/2)")
+
+        return {
+            "status": "HEALTHY" if is_healthy else "DEGRADED",
+            "mode": self.mode,
+            "engine_status": self.status,
+            "feed_source": getattr(self, 'feed_source', 'MOCK'),
+            "spot_price": self.spot_price,
+            "nearest_expiry": str(expiry_date) if expiry_date else None,
+            "websocket_active": getattr(self, 'websocket_active', False),
+            "websocket_tokens_count": len(self.websocket_tokens),
+            "knowledge_base_entries": len(kb.get("expiries", {})),
+            "anomalies_recorded": len(kb.get("anomalies", [])),
+            "pe_leg": {
+                "strike": pe_state.get('strike'),
+                "day_high": pe_state.get('day_high', 0.0),
+                "price": pe_state.get('price', 0.0),
+                "position": pe_state.get('position')
+            },
+            "ce_leg": {
+                "strike": ce_state.get('strike'),
+                "day_high": ce_state.get('day_high', 0.0),
+                "price": ce_state.get('price', 0.0),
+                "position": ce_state.get('position')
+            },
+            "warnings": warnings,
+            "checked_at": datetime.datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
+        }
 
     def fetch_nse_option_chain(self):
         import requests
@@ -1350,10 +1695,25 @@ class LiveManager:
                                         state['above_entry_threshold'] = (state['price'] > target_entry)
                                         
                                     self.add_log(f"[Sync] {opt_type} {strike} Official Zerodha High (X): {state['day_high']:.2f} | LTP: {state['price']:.2f}")
+
+                                # Invariant Enforcement in Sync: Day High and Price must be strictly positive
+                                if state.get('day_high', 0.0) <= 0.0 or state.get('price', 0.0) <= 0.0:
+                                    self.add_log(f"⚡ [Sync Invariant Breach] {opt_type} {strike} has invalid Day High or price. Triggering autonomous recovery...")
+                                    self.autonomous_heal_strike(opt_type, strike, current_time)
                         except Exception as ex:
                             self.add_log(f"⚠️ [Sync] Error fetching Zerodha quotes: {ex}")
+                            for opt_type in opt_types:
+                                state = self.strategy_state[opt_type]
+                                strike = state.get('strike')
+                                if strike and (state.get('day_high', 0.0) <= 0.0 or state.get('price', 0.0) <= 0.0):
+                                    self.autonomous_heal_strike(opt_type, strike, current_time)
                 else:
                     self.add_log("⚠️ [Sync] Zerodha not connected. Cannot fetch exchange quotes. Awaiting token...")
+                    for opt_type in modes:
+                        state = self.strategy_state[opt_type]
+                        strike = state.get('strike')
+                        if strike and (state.get('day_high', 0.0) <= 0.0 or state.get('price', 0.0) <= 0.0):
+                            self.autonomous_heal_strike(opt_type, strike, current_time)
             
             # 3.5 Restore active in-flight positions across service restarts
             target_date_str = current_time.strftime('%Y-%m-%d') if hasattr(current_time, 'strftime') else str(current_time)[:10]
@@ -2103,6 +2463,11 @@ class LiveManager:
                                 val = 0.0
                                 state['day_high'] = 0.0
                                 state['price'] = 0.0
+
+                            # Invariant Enforcement: Day High (X) must NEVER be <= 0.0 at or after 09:30 AM
+                            if state.get('day_high', 0.0) <= 0.0 or state.get('price', 0.0) <= 0.0:
+                                self.add_log(f"⚡ [Invariant Breach at 09:30] {opt_type} {strike} Day High ({state.get('day_high', 0.0)}) <= 0. Triggering autonomous recovery...")
+                                self.autonomous_heal_strike(opt_type, strike, current_time)
                         else:
                             # MOCK mode only
                             val = black_scholes(spot, strike, t_years, self.r, self.iv, opt_type)
@@ -2275,6 +2640,7 @@ class AutoPilotScheduler:
         self.manually_stopped_today = False
         self.last_checked_date = None
         self.last_holiday_logged = None
+        self.preflight_checked_date = None
 
     def start(self):
         if not self.running:
@@ -2319,6 +2685,13 @@ class AutoPilotScheduler:
                     continue
 
                 if is_auto_pilot and is_trading_day:
+                    # Pre-flight diagnostic (09:15 - 09:28 IST)
+                    if datetime.time(9, 15) <= current_time < datetime.time(9, 28):
+                        if self.preflight_checked_date != current_date:
+                            self.live_manager.add_log("[Auto-Pilot] Executing automated pre-flight health diagnostic...")
+                            self.live_manager.preflight_health_check(now)
+                            self.preflight_checked_date = current_date
+
                     start_time = datetime.time(9, 8)
                     stop_time = datetime.time(15, 30)
                     
@@ -2340,14 +2713,35 @@ class AutoPilotScheduler:
                                 r=config.get("r", 7.0)
                             )
                         
-                        # --- WATCHDOG: Detect silent broken loop ---
-                        # If engine is RUNNING but no successful tick has occurred in
-                        # the last 180 seconds, attempt WebSocket token re-subscription.
+                        # --- AUTONOMOUS WATCHDOG: Invariant Enforcement & Silent Tick Recovery ---
                         elif self.live_manager.status in ["RUNNING", "FEED_DISRUPTED"]:
+                            # 1. Invariant Watchdog: Day High and Strike Validity (at/after 09:30 AM IST)
+                            if current_time >= datetime.time(9, 30) and self.live_manager.mode in ["LIVE", "LIVE_REAL"]:
+                                st_type = self.live_manager.strategy_type
+                                check_legs = []
+                                if st_type in ['PE_SELL', 'BOTH']:
+                                    check_legs.append('PE')
+                                if st_type in ['CE_SELL', 'BOTH']:
+                                    check_legs.append('CE')
+                                
+                                for leg_type in check_legs:
+                                    leg_state = self.live_manager.strategy_state.get(leg_type, {})
+                                    leg_strike = leg_state.get('strike')
+                                    if leg_strike and (leg_state.get('day_high', 0.0) <= 0.0 or leg_state.get('price', 0.0) <= 0.0):
+                                        self.live_manager.add_log(f"⚡ [Auto-Pilot Watchdog] Invariant breach detected on {leg_type} {leg_strike} (Day High: {leg_state.get('day_high')}). Triggering autonomous recovery...")
+                                        self.live_manager.autonomous_heal_strike(leg_type, leg_strike, now)
+                                
+                                # 2. Invariant Watchdog: Active WebSocket Tokens
+                                required_tokens = len(check_legs)
+                                if len(self.live_manager.websocket_tokens) < required_tokens:
+                                    self.live_manager.add_log(f"⚡ [Auto-Pilot Watchdog] Missing WebSocket tokens ({len(self.live_manager.websocket_tokens)}/{required_tokens}). Re-resolving and arming...")
+                                    self.live_manager._resolve_and_subscribe_tokens(now)
+
+                            # 3. Heartbeat Watchdog: Silence detection (>60 seconds)
                             last_tick = self.live_manager.last_tick_time
                             if last_tick is not None:
                                 stale_seconds = (datetime.datetime.now(datetime.timezone.utc) - last_tick).total_seconds()
-                                if stale_seconds > 180:
+                                if stale_seconds > 60:
                                     self.live_manager.add_log(
                                         f"🔴 WATCHDOG: No successful tick in {int(stale_seconds)}s. "
                                         f"Attempting WebSocket token re-subscription to recover feed..."

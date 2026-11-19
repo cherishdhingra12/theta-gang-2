@@ -1,0 +1,24 @@
+{
+  "expiries": {
+    "2026-11-23": {
+      "format": "MONTHLY",
+      "year": 26,
+      "month_str": "NOV",
+      "verified_symbols": {}
+    }
+  },
+  "anomalies": [
+    {
+      "timestamp": "2026-11-19T12:54:24.345569+05:30",
+      "expiry": "2026-11-23",
+      "method": "PERMUTATION_PROBE",
+      "resolved_symbol": "NIFTY26NOV25000CE"
+    },
+    {
+      "timestamp": "2026-11-19T12:57:29.355105+05:30",
+      "expiry": "2026-11-23",
+      "method": "PERMUTATION_PROBE",
+      "resolved_symbol": "NIFTY26NOV25000CE"
+    }
+  ]
+}

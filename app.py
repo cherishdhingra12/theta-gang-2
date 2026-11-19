@@ -474,6 +474,14 @@ def api_live_market_status():
         'day_reason': day_reason
     })
 
+@app.route('/api/live/health', methods=['GET'])
+def api_live_health():
+    try:
+        from live_feed import live_manager
+        return jsonify(live_manager.get_health_status())
+    except Exception as e:
+        return jsonify({'status': 'ERROR', 'error': str(e)}), 500
+
 @app.route('/api/live/stream')
 def api_live_stream():
     q = live_manager.register_client()
@@ -527,13 +535,13 @@ def add_header(response):
     response.headers['Expires'] = '0'
     return response
 
-# Start scheduler thread if Flask is running in main worker
+# Start scheduler thread if Flask is running as the main application
 from live_feed import autopilot_scheduler
-if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not app.debug:
-    autopilot_scheduler.start()
 
 if __name__ == '__main__':
     acquire_lock()
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not app.debug:
+        autopilot_scheduler.start()
     host = os.environ.get('HOST', '127.0.0.1')
     port = int(os.environ.get('PORT', 8080))
     try:

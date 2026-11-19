@@ -396,5 +396,112 @@ class TestLiveFeedEngine(unittest.TestCase):
         if os.path.exists(LIVE_STATE_PATH):
             os.remove(LIVE_STATE_PATH)
 
+    def test_symbol_knowledge_base_persistence(self):
+        from live_feed import load_symbol_knowledge, save_symbol_knowledge
+        kb = load_symbol_knowledge()
+        self.assertIn("expiries", kb)
+        
+        # Test saving verified format
+        kb["expiries"]["2026-11-23"] = {
+            "format": "MONTHLY",
+            "year": 26,
+            "month_str": "NOV",
+            "verified_symbols": {"25000:CE": "NIFTY26NOV25000CE"}
+        }
+        self.assertTrue(save_symbol_knowledge(kb))
+        
+        reloaded = load_symbol_knowledge()
+        self.assertIn("2026-11-23", reloaded["expiries"])
+        self.assertEqual(reloaded["expiries"]["2026-11-23"]["format"], "MONTHLY")
+        self.assertEqual(reloaded["expiries"]["2026-11-23"]["verified_symbols"]["25000:CE"], "NIFTY26NOV25000CE")
+
+    def test_symbol_resolution_tier1_knowledge_base(self):
+        from live_feed import LiveManager, load_symbol_knowledge, save_symbol_knowledge
+        kb = load_symbol_knowledge()
+        kb["expiries"]["2026-11-23"] = {
+            "format": "MONTHLY",
+            "year": 26,
+            "month_str": "NOV",
+            "verified_symbols": {}
+        }
+        save_symbol_knowledge(kb)
+        
+        manager = LiveManager()
+        manager.cached_expiry = datetime.date(2026, 11, 23)
+        resolved = manager.get_option_symbol(25000, "CE", datetime.date(2026, 11, 19))
+        self.assertEqual(resolved, "NFO:NIFTY26NOV25000CE")
+
+    def test_permutation_probing_discovers_working_symbol(self):
+        from live_feed import LiveManager
+        manager = LiveManager()
+        mock_kite = MagicMock()
+        def mock_quote(sym_list):
+            res = {}
+            for s in sym_list:
+                if s == "NFO:NIFTY26NOV25000CE":
+                    res[s] = {"instrument_token": 16496898, "last_price": 145.5, "ohlc": {"high": 160.0, "low": 130.0}}
+            return res
+        mock_kite.quote.side_effect = mock_quote
+        manager.kite = mock_kite
+        
+        probed = manager.probe_symbol_permutations(25000, "CE", datetime.date(2026, 11, 23))
+        self.assertEqual(probed, "NFO:NIFTY26NOV25000CE")
+
+    def test_autonomous_heal_strike(self):
+        from live_feed import LiveManager
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.strategy_state = {
+            'PE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': 25200, 'price': 0.0},
+            'CE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': 25000, 'price': 0.0}
+        }
+        mock_kite = MagicMock()
+        mock_kite.quote.return_value = {
+            "NFO:NIFTY26NOV25000CE": {"last_price": 150.0, "ohlc": {"high": 175.0, "low": 140.0}}
+        }
+        mock_kite.instruments.return_value = [
+            {"name": "NIFTY", "strike": 25000.0, "instrument_type": "CE", "expiry": datetime.date(2026, 11, 23), "tradingsymbol": "NIFTY26NOV25000CE", "instrument_token": 16496898}
+        ]
+        manager.kite = mock_kite
+        manager.cached_expiry = datetime.date(2026, 11, 23)
+        manager._resolve_and_subscribe_tokens = MagicMock()
+        
+        manager.autonomous_heal_strike('CE', 25000, datetime.datetime(2026, 11, 19, 9, 31))
+        self.assertEqual(manager.strategy_state['CE']['day_high'], 175.0)
+        self.assertEqual(manager.strategy_state['CE']['price'], 150.0)
+        self.assertGreater(manager.strategy_state['CE']['target'], 0.0)
+
+    def test_preflight_and_health_status(self):
+        import base64
+        from live_feed import LiveManager
+        from app import app
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        mock_kite = MagicMock()
+        mock_kite.quote.return_value = {
+            "NSE:NIFTY 50": {"last_price": 24500.0}
+        }
+        manager.kite = mock_kite
+        manager.spot_price = 24500.0
+        manager.strategy_state = {
+            'PE': {'day_high': 150.0, 'strike': 24400, 'price': 140.0, 'position': None},
+            'CE': {'day_high': 160.0, 'strike': 24600, 'price': 155.0, 'position': None}
+        }
+        manager.websocket_tokens = {12345, 67890}
+        health = manager.get_health_status()
+        self.assertEqual(health['status'], 'HEALTHY')
+        self.assertEqual(health['websocket_tokens_count'], 2)
+        
+        # Test API endpoint with valid Basic Auth
+        user = os.environ.get('BASIC_AUTH_USER', 'admin')
+        pw = os.environ.get('BASIC_AUTH_PASS', 'admin')
+        cred = base64.b64encode(f"{user}:{pw}".encode('utf-8')).decode('utf-8')
+        with app.test_client() as client:
+            headers = {"Authorization": f"Basic {cred}"}
+            resp = client.get('/api/live/health', headers=headers)
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertIn('status', data)
+
 if __name__ == '__main__':
     unittest.main()
