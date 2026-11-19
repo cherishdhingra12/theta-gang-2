@@ -277,6 +277,8 @@ class LiveManager:
         self.disruption_counter = 0
         self.feed_disrupted = False
         self.cached_expiry = None
+        self.cached_nfo_instruments = None
+        self.cached_nfo_instruments_time = 0.0
 
         # Stability / watchdog fields
         self._loop_error_count = 0          # Consecutive loop errors counter
@@ -487,6 +489,27 @@ class LiveManager:
         except Exception as e:
             print(f"Error in persist_state: {e}")
 
+    def _ensure_nfo_instruments(self):
+        """
+        Fetches and caches NIFTY derivative instruments from Zerodha NFO master.
+        Cached for 4 hours to minimize network traffic and API overhead.
+        """
+        if getattr(self, 'kite', None) is None:
+            return None
+        now = time.time()
+        if getattr(self, 'cached_nfo_instruments', None) is not None and (now - getattr(self, 'cached_nfo_instruments_time', 0.0)) < 14400:
+            return self.cached_nfo_instruments
+        try:
+            insts = self.kite.instruments('NFO')
+            nifty_insts = [i for i in insts if i.get('name') == 'NIFTY']
+            if nifty_insts:
+                self.cached_nfo_instruments = nifty_insts
+                self.cached_nfo_instruments_time = now
+                return self.cached_nfo_instruments
+        except Exception as e:
+            self.add_log(f"⚠️ Error fetching Zerodha NFO instruments: {e}")
+        return getattr(self, 'cached_nfo_instruments', None)
+
     def get_nearest_nifty_expiry(self, current_date):
         if hasattr(current_date, 'date'):
             current_date = current_date.date()
@@ -498,14 +521,15 @@ class LiveManager:
         # 1. Try Zerodha
         if getattr(self, 'kite_configured', False) and getattr(self, 'kite', None) is not None:
             try:
-                insts = self.kite.instruments('NFO')
-                nifty_insts = [i for i in insts if i['name'] == 'NIFTY' and i['expiry']]
-                expiries = sorted(list(set(i['expiry'] for i in nifty_insts)))
-                valid_expiries = [e for e in expiries if e >= current_date]
-                if valid_expiries:
-                    self.cached_expiry = valid_expiries[0]
-                    self.add_log(f"Nearest Nifty expiry resolved from Zerodha: {self.cached_expiry}")
-                    return self.cached_expiry
+                nifty_insts = self._ensure_nfo_instruments()
+                if nifty_insts:
+                    expiries = sorted(list(set(i['expiry'] for i in nifty_insts if i.get('expiry'))))
+                    valid_expiries = [e for e in expiries if (e if isinstance(e, datetime.date) else datetime.date.fromisoformat(str(e))) >= current_date]
+                    if valid_expiries:
+                        first_exp = valid_expiries[0]
+                        self.cached_expiry = first_exp if isinstance(first_exp, datetime.date) else datetime.date.fromisoformat(str(first_exp))
+                        self.add_log(f"Nearest Nifty expiry resolved from Zerodha: {self.cached_expiry}")
+                        return self.cached_expiry
             except Exception as e:
                 print(f"Error fetching expiry from Zerodha: {e}")
                 
@@ -668,7 +692,39 @@ class LiveManager:
         
         expiry_date = self.get_nearest_nifty_expiry(current_date)
         
-        is_monthly = (expiry_date + datetime.timedelta(days=7)).month != expiry_date.month
+        # 1. Authoritative lookup directly from Zerodha instrument master if Kite is connected
+        if getattr(self, 'kite', None) is not None:
+            insts = self._ensure_nfo_instruments()
+            if insts:
+                for inst in insts:
+                    if (inst.get("strike") == float(strike)
+                            and inst.get("instrument_type") == opt_type
+                            and str(inst.get("expiry")) == str(expiry_date)):
+                        ts = inst.get("tradingsymbol")
+                        if ts:
+                            return f"NFO:{ts}"
+
+        # 2. Fallback heuristic string construction (for offline simulation / unit tests)
+        is_monthly = False
+        cached_insts = getattr(self, 'cached_nfo_instruments', None)
+        if cached_insts:
+            other_expiries = []
+            for i in cached_insts:
+                exp = i.get('expiry')
+                if not exp:
+                    continue
+                if isinstance(exp, str):
+                    try:
+                        exp = datetime.date.fromisoformat(exp)
+                    except Exception:
+                        continue
+                if exp.year == expiry_date.year and exp.month == expiry_date.month and exp > expiry_date:
+                    other_expiries.append(exp)
+            if not other_expiries:
+                is_monthly = True
+        else:
+            is_monthly = (expiry_date + datetime.timedelta(days=7)).month != expiry_date.month or expiry_date.day >= 23
+
         yy = str(expiry_date.year)[2:]
         
         if is_monthly:
@@ -1791,19 +1847,24 @@ class LiveManager:
             # Clear previous tokens
             self.websocket_tokens = {}
             
+            pe_tok = None
             if pe_symbol and pe_symbol in quotes:
                 pe_q = quotes[pe_symbol]
                 pe_tok = pe_q.get("instrument_token")
                 if pe_tok:
                     self.websocket_tokens[pe_tok] = {"opt_type": "PE", "symbol": pe_symbol}
                     
+            ce_tok = None
             if ce_symbol and ce_symbol in quotes:
                 ce_q = quotes[ce_symbol]
                 ce_tok = ce_q.get("instrument_token")
                 if ce_tok:
                     self.websocket_tokens[ce_tok] = {"opt_type": "CE", "symbol": ce_symbol}
                     
-            self.add_log(f"Resolved tokens for WebSocket: Spot={self.spot_token} | PE={pe_strike} ({pe_symbol}) | CE={ce_strike} ({ce_symbol})")
+            self.add_log(f"Resolved tokens for WebSocket: Spot={self.spot_token} | PE={pe_strike} ({pe_symbol} -> {pe_tok}) | CE={ce_strike} ({ce_symbol} -> {ce_tok})")
+            
+            if not self.websocket_tokens:
+                self.add_log(f"⚠️ Warning: No option tokens resolved for WebSocket. PE={pe_symbol}, CE={ce_symbol}")
             
             # Connect or update subscription
             if self.kws and self.kws.is_connected():

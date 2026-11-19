@@ -352,6 +352,22 @@ class TestLiveFeedEngine(unittest.TestCase):
         dt_monthly = datetime.date(2026, 6, 30)
         symbol_monthly = manager.get_option_symbol(24000, 'CE', dt_monthly)
         self.assertEqual(symbol_monthly, "NFO:NIFTY26JUN24000CE")
+
+        # Test Kite-connected instrument master lookup for non-standard / holiday monthly expiries (e.g. 2026-11-23)
+        mock_kite = MagicMock()
+        mock_kite.instruments.return_value = [
+            {"name": "NIFTY", "strike": 25000.0, "instrument_type": "CE", "expiry": datetime.date(2026, 11, 23), "tradingsymbol": "NIFTY26NOV25000CE"},
+            {"name": "NIFTY", "strike": 25200.0, "instrument_type": "PE", "expiry": datetime.date(2026, 11, 23), "tradingsymbol": "NIFTY26NOV25200PE"},
+        ]
+        manager.kite = mock_kite
+        manager.kite_configured = True
+        manager.cached_expiry = None
+        manager.cached_nfo_instruments = None
+        dt_nov = datetime.date(2026, 11, 19)
+        symbol_ce = manager.get_option_symbol(25000, 'CE', dt_nov)
+        symbol_pe = manager.get_option_symbol(25200, 'PE', dt_nov)
+        self.assertEqual(symbol_ce, "NFO:NIFTY26NOV25000CE")
+        self.assertEqual(symbol_pe, "NFO:NIFTY26NOV25200PE")
         
     def test_totp_generation(self):
         from kite_auth import generate_totp
