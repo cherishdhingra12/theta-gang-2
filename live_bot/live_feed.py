@@ -67,6 +67,8 @@ def save_live_state(state_data):
                 return {k: sanitize(v) for k, v in obj.items()}
             elif isinstance(obj, list):
                 return [sanitize(v) for v in obj]
+            elif isinstance(obj, (datetime.datetime, datetime.date)):
+                return obj.isoformat()
             elif isinstance(obj, float) and (obj == float('inf') or obj == float('-inf')):
                 return 999999.0
             return obj
@@ -365,6 +367,8 @@ class LiveManager:
                         params["price"] = round(float(trigger_price) * 0.95, 2)  # 5% buffer for Sell SL
                 else:
                     params["price"] = round(float(price), 2)
+            elif order_type == "LIMIT":
+                params["price"] = round(float(price), 2)
             elif order_type == "MARKET":
                 params["market_protection"] = 1.0
                 
@@ -965,7 +969,11 @@ class LiveManager:
         state['current_sl'] = state['day_high']
         target_entry = state['day_high'] * (1.0 - self.entry_discount)
         if state['price'] > 0:
-            state['above_entry_threshold'] = (state['price'] > target_entry)
+            grace_lower_bound = state['day_high'] * (1.0 - (self.entry_discount + 0.05))
+            if state.get('entry_count', 0) == 0 and grace_lower_bound <= state['price'] <= target_entry:
+                state['above_entry_threshold'] = True
+            else:
+                state['above_entry_threshold'] = (state['price'] > target_entry)
             
         # 6. Re-subscribe WebSocket tokens
         self._resolve_and_subscribe_tokens(current_time)
@@ -1436,8 +1444,8 @@ class LiveManager:
             
             # Initialize Strategy State
             self.strategy_state = {
-                'PE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None},
-                'CE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None}
+                'PE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None},
+                'CE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None}
             }
             
             # Setup simulated clock for Mock Mode
@@ -1692,7 +1700,11 @@ class LiveManager:
                                     
                                     target_entry = state['day_high'] * (1.0 - self.entry_discount)
                                     if state['price'] > 0:
-                                        state['above_entry_threshold'] = (state['price'] > target_entry)
+                                        grace_lower_bound = state['day_high'] * (1.0 - (self.entry_discount + 0.05))
+                                        if state.get('entry_count', 0) == 0 and grace_lower_bound <= state['price'] <= target_entry:
+                                            state['above_entry_threshold'] = True
+                                        else:
+                                            state['above_entry_threshold'] = (state['price'] > target_entry)
                                         
                                     self.add_log(f"[Sync] {opt_type} {strike} Official Zerodha High (X): {state['day_high']:.2f} | LTP: {state['price']:.2f}")
 
@@ -1722,8 +1734,12 @@ class LiveManager:
             if saved_state and saved_state.get('date') == target_date_str:
                 for opt_type in ['PE', 'CE']:
                     s_leg = saved_state.get('strategy_state', {}).get(opt_type, {})
+                    leg = self.strategy_state[opt_type]
+                    if s_leg.get('recent_sl_times'):
+                        leg['recent_sl_times'] = s_leg['recent_sl_times']
+                    if s_leg.get('cooldown_until'):
+                        leg['cooldown_until'] = s_leg['cooldown_until']
                     if s_leg.get('position'):
-                        leg = self.strategy_state[opt_type]
                         leg['position'] = s_leg['position']
                         leg['entry_price'] = s_leg.get('entry_price', 0.0)
                         leg['entry_time'] = s_leg.get('entry_time')
@@ -1909,17 +1925,50 @@ class LiveManager:
             if getattr(self, 'feed_disrupted', False) or getattr(self, 'circuit_breaker_tripped', False):
                 return
                 
+            # Recommendation 2: Cooldown Circuit Breaker Check
+            cooldown_until = state.get('cooldown_until')
+            if cooldown_until:
+                if isinstance(cooldown_until, str):
+                    try:
+                        cooldown_until_dt = datetime.datetime.fromisoformat(cooldown_until)
+                    except Exception:
+                        cooldown_until_dt = None
+                else:
+                    cooldown_until_dt = cooldown_until
+                
+                if cooldown_until_dt:
+                    if hasattr(current_time, 'tzinfo') and current_time.tzinfo is not None and cooldown_until_dt.tzinfo is None:
+                        cooldown_until_dt = current_time.tzinfo.localize(cooldown_until_dt)
+                    elif hasattr(current_time, 'tzinfo') and current_time.tzinfo is None and cooldown_until_dt.tzinfo is not None:
+                        cooldown_until_dt = cooldown_until_dt.replace(tzinfo=None)
+
+                    if current_time < cooldown_until_dt:
+                        # Cooldown in effect, skip new entry
+                        return
+                    else:
+                        # Cooldown period completed
+                        state['cooldown_until'] = None
+                        self.add_log(f"🟢 [COOLDOWN EXPIRED] {opt_type} 45-minute cooling period ended. Resuming trade evaluation.")
+                        send_telegram_alert(f"🟢 <b>COOLDOWN EXPIRED</b>\n{opt_type} cooling period ended. Resuming trade evaluation.")
+
             target_entry = state['day_high'] * (1.0 - self.entry_discount)
             
+            # Option A: Initial Entry Grace Band
             if state.get('above_entry_threshold') is None:
                 if o_price > 0:
-                    state['above_entry_threshold'] = (o_price > target_entry)
+                    grace_lower_bound = state['day_high'] * (1.0 - (self.entry_discount + 0.05))
+                    if state.get('entry_count', 0) == 0 and grace_lower_bound <= o_price <= target_entry:
+                        state['above_entry_threshold'] = True
+                        self.add_log(f"🎯 [GRACE BAND ACTIVE] {opt_type} {strike} opened at ₹{o_price:.2f} within 5% grace band [{grace_lower_bound:.2f} - {target_entry:.2f}]. Enabling immediate entry.")
+                    else:
+                        state['above_entry_threshold'] = (o_price > target_entry)
             elif o_price > target_entry:
                 state['above_entry_threshold'] = True
                 
             if state['entry_count'] < self.max_reentries:
                 if o_price <= target_entry and o_price > 0 and state.get('above_entry_threshold', False):
-                    entry_fill_price = o_price
+                    # Recommendation 1: Limit Order Fill Capping
+                    entry_fill_price = round(target_entry, 2)
                     
                     if self.mode == "LIVE_REAL" and self.kite:
                         # Pre-trade Margin Verification
@@ -1932,7 +1981,7 @@ class LiveManager:
                             return
                             
                         symbol = self.get_option_symbol(strike, opt_type, current_time)
-                        res = self.place_zerodha_order(symbol, "SELL", 2 * self.lot_size, order_type="MARKET")
+                        res = self.place_zerodha_order(symbol, "SELL", 2 * self.lot_size, order_type="LIMIT", price=entry_fill_price)
                         if res and res.get("status") == "REJECTED":
                             self.add_log(f"🔴 Real Entry Order REJECTED. Position skipped.")
                             return
@@ -2014,6 +2063,35 @@ class LiveManager:
                 
                 self.add_log(f"[{reason.upper()}] {opt_type} SL hit at {exit_fill_price:.2f} (PnL: ₹{pnl:.2f})")
                 send_telegram_alert(f"🛑 <b>{reason.upper()} HIT</b>\n{opt_type} {strike} Closed @ ₹{exit_fill_price:.2f}\nPnL: ₹{pnl:.2f}")
+
+                # Recommendation 2: Consecutive Loss Circuit Breaker Tracking
+                now_ts = current_time
+                sl_list = state.get('recent_sl_times', [])
+                clean_sl_list = []
+                for t in sl_list:
+                    if isinstance(t, str):
+                        try:
+                            t_dt = datetime.datetime.fromisoformat(t)
+                        except Exception:
+                            continue
+                    else:
+                        t_dt = t
+                    if hasattr(now_ts, 'tzinfo') and now_ts.tzinfo is not None and t_dt.tzinfo is None:
+                        t_dt = now_ts.tzinfo.localize(t_dt)
+                    elif hasattr(now_ts, 'tzinfo') and now_ts.tzinfo is None and t_dt.tzinfo is not None:
+                        t_dt = t_dt.replace(tzinfo=None)
+                    if hasattr(now_ts, '__sub__') and (now_ts - t_dt).total_seconds() <= 90 * 60:
+                        clean_sl_list.append(t_dt)
+                clean_sl_list.append(now_ts)
+
+                if len(clean_sl_list) >= 3:
+                    state['cooldown_until'] = now_ts + datetime.timedelta(minutes=45)
+                    state['recent_sl_times'] = []
+                    cooldown_str = state['cooldown_until'].strftime('%H:%M:%S')
+                    self.add_log(f"⚠️ [CIRCUIT BREAKER] {opt_type} triggered 3 consecutive Stop Losses within 90 minutes. Entering 45-minute cooldown until {cooldown_str}.")
+                    send_telegram_alert(f"⚠️ <b>CONSECUTIVE LOSS CIRCUIT BREAKER</b>\n{opt_type} triggered 3 consecutive Stop Losses within 90 minutes.\nPausing {opt_type} entries for 45 minutes until {cooldown_str}.")
+                else:
+                    state['recent_sl_times'] = clean_sl_list
                 
             # Check Target Lot 1
             elif o_price <= state['target']:
@@ -2042,6 +2120,9 @@ class LiveManager:
                     "reason": "Target (Lot 1)"
                 }
                 save_live_trade(trade_rec)
+                
+                # Recommendation 2: Reset consecutive loss tracking when profit target is hit
+                state['recent_sl_times'] = []
                 
                 state['position'] = 'SHORT_1_LOT'
                 state['unrealized'] = (state['entry_price'] - o_price) * self.lot_size
@@ -2477,7 +2558,12 @@ class LiveManager:
                         self.add_log(f"Strike Selected: {opt_type} {strike} | Day High (X): {state['day_high']:.2f}")
                         target_entry = state['day_high'] * (1.0 - self.entry_discount)
                         if state['price'] > 0:
-                            state['above_entry_threshold'] = (state['price'] > target_entry)
+                            grace_lower_bound = state['day_high'] * (1.0 - (self.entry_discount + 0.05))
+                            if state.get('entry_count', 0) == 0 and grace_lower_bound <= state['price'] <= target_entry:
+                                state['above_entry_threshold'] = True
+                                self.add_log(f"🎯 [GRACE BAND ACTIVE at 09:30] {opt_type} {strike} opened at ₹{state['price']:.2f} within 5% grace band [{grace_lower_bound:.2f} - {target_entry:.2f}]. Enabling immediate entry.")
+                            else:
+                                state['above_entry_threshold'] = (state['price'] > target_entry)
                         else:
                             state['above_entry_threshold'] = None
                             

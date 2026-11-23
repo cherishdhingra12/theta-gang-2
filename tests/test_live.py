@@ -503,5 +503,230 @@ class TestLiveFeedEngine(unittest.TestCase):
             data = resp.get_json()
             self.assertIn('status', data)
 
+    def test_limit_order_fill_capping(self):
+        """Recommendation 1: Limit Order Fill Capping eliminates negative slippage when tick drops below target_entry."""
+        from live_feed import LiveManager
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.entry_discount = 0.10
+        manager.lot_size = 65
+        manager.max_reentries = 5
+        manager.lot_1_target_pct = 0.30
+        manager.strategy_state = {
+            'PE': {
+                'strike': 24000,
+                'day_high': 200.0,
+                'entry_count': 0,
+                'position': None,
+                'entry_price': 0.0,
+                'current_sl': 0.0,
+                'target': 0.0,
+                'min_price': float('inf'),
+                'unrealized': 0.0,
+                'price': 195.0,
+                'above_entry_threshold': True,
+                'recent_sl_times': [],
+                'cooldown_until': None
+            }
+        }
+        
+        # Target entry is 200 * 0.9 = 180.0
+        # Tick arrives with jump downward to 172.50
+        current_time = datetime.datetime(2026, 11, 23, 10, 0, 0)
+        manager._evaluate_strategy_for_leg('PE', 172.50, 172.50, 172.50, current_time)
+        
+        # Verify position opened
+        pe_state = manager.strategy_state['PE']
+        self.assertEqual(pe_state['position'], 'SHORT_2_LOTS')
+        # Verify limit order fill capping: filled at 180.00, NOT 172.50!
+        self.assertEqual(pe_state['entry_price'], 180.00)
+        self.assertEqual(pe_state['current_sl'], 200.00)
+
+    def test_consecutive_loss_cooldown_circuit_breaker(self):
+        """Recommendation 2: 3 consecutive Stop Losses within 90 minutes trigger 45-minute cooldown."""
+        from live_feed import LiveManager
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.entry_discount = 0.10
+        manager.lot_size = 65
+        manager.max_reentries = 10
+        manager.lot_1_target_pct = 0.30
+        manager.strategy_state = {
+            'CE': {
+                'strike': 24500,
+                'day_high': 100.0,
+                'entry_count': 0,
+                'position': None,
+                'entry_price': 0.0,
+                'current_sl': 0.0,
+                'target': 0.0,
+                'min_price': float('inf'),
+                'unrealized': 0.0,
+                'price': 95.0,
+                'above_entry_threshold': True,
+                'recent_sl_times': [],
+                'cooldown_until': None
+            }
+        }
+        
+        # Simulate 3 consecutive Stop Losses within 90 minutes
+        # SL 1 at 10:00 AM
+        t1 = datetime.datetime(2026, 11, 23, 10, 0, 0)
+        manager._evaluate_strategy_for_leg('CE', 90.0, 90.0, 90.0, t1) # Entry 1 @ 90
+        manager._evaluate_strategy_for_leg('CE', 101.0, 101.0, 101.0, t1 + datetime.timedelta(minutes=5)) # SL 1 @ 10:05
+        self.assertEqual(len(manager.strategy_state['CE']['recent_sl_times']), 1)
+        self.assertIsNone(manager.strategy_state['CE']['cooldown_until'])
+
+        # SL 2 at 10:20 AM
+        t2 = datetime.datetime(2026, 11, 23, 10, 20, 0)
+        manager.strategy_state['CE']['above_entry_threshold'] = True
+        manager._evaluate_strategy_for_leg('CE', 90.0, 90.0, 90.0, t2) # Entry 2 @ 90
+        manager._evaluate_strategy_for_leg('CE', 101.0, 101.0, 101.0, t2 + datetime.timedelta(minutes=5)) # SL 2 @ 10:25
+        self.assertEqual(len(manager.strategy_state['CE']['recent_sl_times']), 2)
+        self.assertIsNone(manager.strategy_state['CE']['cooldown_until'])
+
+        # SL 3 at 10:40 AM (within 90 mins of SL 1)
+        t3 = datetime.datetime(2026, 11, 23, 10, 40, 0)
+        manager.strategy_state['CE']['above_entry_threshold'] = True
+        manager._evaluate_strategy_for_leg('CE', 90.0, 90.0, 90.0, t3) # Entry 3 @ 90
+        manager._evaluate_strategy_for_leg('CE', 101.0, 101.0, 101.0, t3 + datetime.timedelta(minutes=5)) # SL 3 @ 10:45
+        
+        # Now 3 consecutive SLs reached: cooldown circuit breaker MUST trip
+        ce_state = manager.strategy_state['CE']
+        self.assertIsNotNone(ce_state['cooldown_until'])
+        expected_cooldown_end = t3 + datetime.timedelta(minutes=5) + datetime.timedelta(minutes=45)
+        self.assertEqual(ce_state['cooldown_until'], expected_cooldown_end)
+        self.assertEqual(ce_state['recent_sl_times'], [])
+
+        # Attempt entry during cooldown at 11:00 AM (cooldown active until 11:30 AM)
+        t_blocked = datetime.datetime(2026, 11, 23, 11, 0, 0)
+        ce_state['above_entry_threshold'] = True
+        manager._evaluate_strategy_for_leg('CE', 90.0, 90.0, 90.0, t_blocked)
+        self.assertIsNone(ce_state['position']) # Blocked!
+
+        # Attempt entry after cooldown expires at 11:31 AM
+        t_resumed = datetime.datetime(2026, 11, 23, 11, 31, 0)
+        manager._evaluate_strategy_for_leg('CE', 90.0, 90.0, 90.0, t_resumed)
+        self.assertIsNone(ce_state['cooldown_until']) # Cleared!
+        self.assertEqual(ce_state['position'], 'SHORT_2_LOTS') # Entry permitted!
+
+    def test_target_resets_consecutive_losses(self):
+        """Recommendation 2: Target 1 hit resets recent_sl_times to avoid premature circuit breaker."""
+        from live_feed import LiveManager
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.entry_discount = 0.10
+        manager.lot_size = 65
+        manager.lot_1_target_pct = 0.30
+        manager.max_reentries = 10
+        manager.strategy_state = {
+            'PE': {
+                'strike': 24000,
+                'day_high': 100.0,
+                'entry_count': 0,
+                'position': None,
+                'entry_price': 0.0,
+                'current_sl': 0.0,
+                'target': 0.0,
+                'min_price': float('inf'),
+                'unrealized': 0.0,
+                'price': 95.0,
+                'above_entry_threshold': True,
+                'recent_sl_times': [datetime.datetime(2026, 11, 23, 10, 0, 0), datetime.datetime(2026, 11, 23, 10, 15, 0)],
+                'cooldown_until': None
+            }
+        }
+        
+        # 2 SLs in history. Next trade enters and hits Target Lot 1 (100 * 0.7 = 70.0)
+        t = datetime.datetime(2026, 11, 23, 10, 30, 0)
+        manager._evaluate_strategy_for_leg('PE', 90.0, 90.0, 90.0, t)
+        self.assertEqual(manager.strategy_state['PE']['position'], 'SHORT_2_LOTS')
+        
+        # Price hits target 70.0
+        manager._evaluate_strategy_for_leg('PE', 69.5, 69.5, 69.5, t + datetime.timedelta(minutes=10))
+        # Target 1 hit: recent_sl_times MUST be reset to empty list
+        self.assertEqual(manager.strategy_state['PE']['recent_sl_times'], [])
+
+    def test_initial_entry_grace_band(self):
+        """Option A: Initial Entry Grace Band enables immediate entry when opening within 5% below target_entry."""
+        from live_feed import LiveManager
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.entry_discount = 0.10
+        manager.lot_size = 65
+        manager.lot_1_target_pct = 0.30
+        manager.max_reentries = 5
+        
+        # Case A: Option opens at 176 (Day High = 200, Target = 180).
+        # 176 is within 5% grace band [170, 180] (12% discount).
+        manager.strategy_state = {
+            'PE': {
+                'strike': 24000,
+                'day_high': 200.0,
+                'entry_count': 0,
+                'position': None,
+                'entry_price': 0.0,
+                'current_sl': 0.0,
+                'target': 0.0,
+                'min_price': float('inf'),
+                'unrealized': 0.0,
+                'price': 176.0,
+                'above_entry_threshold': None, # Initial uninitialized
+                'recent_sl_times': [],
+                'cooldown_until': None
+            }
+        }
+        t = datetime.datetime(2026, 11, 23, 9, 30, 1)
+        manager._evaluate_strategy_for_leg('PE', 176.0, 176.0, 176.0, t)
+        # Should trigger entry immediately!
+        pe_state = manager.strategy_state['PE']
+        self.assertEqual(pe_state['position'], 'SHORT_2_LOTS')
+        self.assertEqual(pe_state['entry_price'], 180.00) # Capped at target_entry
+        self.assertEqual(pe_state['entry_count'], 1)
+
+        # Case B: Option opens at 160 (20% discount, outside 5% grace band [170, 180]).
+        manager.strategy_state = {
+            'CE': {
+                'strike': 24500,
+                'day_high': 200.0,
+                'entry_count': 0,
+                'position': None,
+                'entry_price': 0.0,
+                'current_sl': 0.0,
+                'target': 0.0,
+                'min_price': float('inf'),
+                'unrealized': 0.0,
+                'price': 160.0,
+                'above_entry_threshold': None,
+                'recent_sl_times': [],
+                'cooldown_until': None
+            }
+        }
+        manager._evaluate_strategy_for_leg('CE', 160.0, 160.0, 160.0, t)
+        ce_state = manager.strategy_state['CE']
+        self.assertIsNone(ce_state['position']) # NOT triggered
+        self.assertFalse(ce_state['above_entry_threshold'])
+
+        # Case C: Re-entry (entry_count > 0) does NOT get grace band
+        manager.strategy_state = {
+            'PE': {
+                'strike': 24000,
+                'day_high': 200.0,
+                'entry_count': 1, # Re-entry
+                'position': None,
+                'entry_price': 0.0,
+                'current_sl': 0.0,
+                'target': 0.0,
+                'min_price': float('inf'),
+                'unrealized': 0.0,
+                'price': 176.0,
+                'above_entry_threshold': None,
+                'recent_sl_times': [],
+                'cooldown_until': None
+            }
+        }
+        manager._evaluate_strategy_for_leg('PE', 176.0, 176.0, 176.0, t)
+        self.assertIsNone(manager.strategy_state['PE']['position']) # NOT triggered
+
 if __name__ == '__main__':
     unittest.main()

@@ -309,6 +309,8 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
             entry_count = 0
             position = None  # None, 'SHORT_2_LOTS', 'SHORT_1_LOT'
             above_entry_threshold = None
+            recent_sl_times = []
+            cooldown_until = None
             
             # Trading stats for this contract today
             entry_price = 0.0
@@ -373,6 +375,13 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                 
                 # 3. Position Logic
                 if position is None:
+                    # Check Cooldown Circuit Breaker
+                    if cooldown_until is not None:
+                        if dt < cooldown_until:
+                            continue
+                        else:
+                            cooldown_until = None
+
                     # Flat state: Monitor for new day highs or entry fills
                     if o_high > day_high:
                         day_high = o_high
@@ -380,9 +389,13 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                     
                     target_entry_price = day_high * (1.0 - entry_discount)
                     
-                    # Initialize or track above_entry_threshold
+                    # Initialize or track above_entry_threshold with Initial Entry Grace Band
                     if above_entry_threshold is None:
-                        above_entry_threshold = (o_open > target_entry_price)
+                        grace_lower_bound = day_high * (1.0 - (entry_discount + 0.05))
+                        if entry_count == 0 and grace_lower_bound <= o_open <= target_entry_price:
+                            above_entry_threshold = True
+                        else:
+                            above_entry_threshold = (o_open > target_entry_price)
                     if o_high > target_entry_price:
                         above_entry_threshold = True
                     
@@ -390,8 +403,8 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                     if entry_count < max_reentries:
                         # We trigger if Low is below or equal to target_entry_price and we crossed from above
                         if above_entry_threshold and o_low <= target_entry_price:
-                            # Enter position (fill at open if it opened below threshold, otherwise exactly at threshold)
-                            entry_price = target_entry_price if o_open >= target_entry_price else o_open
+                            # Enter position with Limit Order Fill Capping
+                            entry_price = target_entry_price
                             entry_time = dt
                             position = 'SHORT_2_LOTS'
                             entry_count += 1
@@ -441,6 +454,11 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                         day_high = max(day_high, o_high)
                         position = None
                         above_entry_threshold = None
+                        recent_sl_times = [t for t in recent_sl_times if (dt - t).total_seconds() <= 90 * 60]
+                        recent_sl_times.append(dt)
+                        if len(recent_sl_times) >= 3:
+                            cooldown_until = dt + datetime.timedelta(minutes=45)
+                            recent_sl_times = []
                         
                     elif o_high >= current_sl:
                         # Stop Loss Hit
@@ -465,6 +483,11 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                         day_high = max(day_high, o_high)
                         position = None
                         above_entry_threshold = None
+                        recent_sl_times = [t for t in recent_sl_times if (dt - t).total_seconds() <= 90 * 60]
+                        recent_sl_times.append(dt)
+                        if len(recent_sl_times) >= 3:
+                            cooldown_until = dt + datetime.timedelta(minutes=45)
+                            recent_sl_times = []
                         
                     elif o_low <= lot1_target:
                         # Lot 1 Target Hit!
@@ -481,6 +504,9 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                             'Reason': 'Target (Lot 1)', 'DayHigh': round(day_high, 2),
                             'ReEntryNum': entry_count
                         })
+                        
+                        # Reset consecutive losses on profit target hit
+                        recent_sl_times = []
                         
                         # Move to 1 lot state and trail SL
                         position = 'SHORT_1_LOT'
