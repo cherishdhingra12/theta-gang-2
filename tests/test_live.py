@@ -1,6 +1,7 @@
 import unittest
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'backtester'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'live_bot'))
@@ -9,11 +10,19 @@ from unittest.mock import patch, MagicMock
 import datetime
 import pytz
 import json
+import live_feed
 from live_feed import LiveManager, live_manager
 
 class TestLiveFeedEngine(unittest.TestCase):
     
     def setUp(self):
+        # Isolate file writes from production environment
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.orig_trades_path = live_feed.TRADES_PATH
+        self.orig_state_path = live_feed.LIVE_STATE_PATH
+        live_feed.TRADES_PATH = os.path.join(self.test_dir.name, "live_trades.json")
+        live_feed.LIVE_STATE_PATH = os.path.join(self.test_dir.name, "live_state.json")
+
         # Sample mockup response from the NSE Option Chain API
         self.mock_option_chain_data = {
             "records": {
@@ -64,6 +73,11 @@ class TestLiveFeedEngine(unittest.TestCase):
                 ]
             }
         }
+
+    def tearDown(self):
+        live_feed.TRADES_PATH = self.orig_trades_path
+        live_feed.LIVE_STATE_PATH = self.orig_state_path
+        self.test_dir.cleanup()
 
     def test_live_manager_mock_lifecycle(self):
         # Test life cycle transitions of the LiveManager engine in Mock mode
