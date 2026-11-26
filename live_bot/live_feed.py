@@ -20,6 +20,12 @@ TRADES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'live_tra
 LIVE_STATE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'live_state.json')
 SYMBOL_KNOWLEDGE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'symbol_knowledge.json')
 
+def round_to_tick(price, tick_size=0.05):
+    """Round price to the nearest NSE option tick size (₹0.05)."""
+    if price is None or price <= 0:
+        return 0.0
+    return round(round(float(price) / tick_size) * tick_size, 2)
+
 def load_symbol_knowledge():
     if not os.path.exists(SYMBOL_KNOWLEDGE_PATH):
         return {"expiries": {}, "anomalies": []}
@@ -359,16 +365,15 @@ class LiveManager:
             
             # Handle SL-L (Stop-Loss Limit) with buffer to comply with Zerodha's disabled SL-M restriction
             if order_type == "SL":
-                params["trigger_price"] = round(float(trigger_price), 2)
+                trig = round_to_tick(trigger_price)
+                params["trigger_price"] = trig
                 if price <= 0:
-                    if transaction_type == "BUY":
-                        params["price"] = round(float(trigger_price) * 1.05, 2)  # 5% buffer for Buy SL
-                    else:
-                        params["price"] = round(float(trigger_price) * 0.95, 2)  # 5% buffer for Sell SL
+                    buf_price = trig * (1.05 if transaction_type == "BUY" else 0.95)
+                    params["price"] = round_to_tick(buf_price)
                 else:
-                    params["price"] = round(float(price), 2)
+                    params["price"] = round_to_tick(price)
             elif order_type == "LIMIT":
-                params["price"] = round(float(price), 2)
+                params["price"] = round_to_tick(price)
             elif order_type == "MARKET":
                 params["market_protection"] = 1.0
                 
@@ -384,23 +389,24 @@ class LiveManager:
                     if history:
                         last_state = history[-1]
                         status = last_state.get("status")
-                        avg_price = last_state.get("average_price", 0.0)
+                        avg_price = float(last_state.get("average_price", 0.0) or 0.0)
+                        filled_qty = int(last_state.get("filled_quantity", 0) or 0)
                         if status == "COMPLETE":
                             self.add_log(f"🎯 [ORDER FILLED] {tradingsymbol} filled @ ₹{avg_price:.2f}")
                             send_telegram_alert(f"🎯 <b>ORDER FILLED</b>\n{transaction_type} {quantity} {tradingsymbol}\nPrice: ₹{avg_price:.2f}\nOrder ID: {order_id}")
-                            return {"order_id": order_id, "status": "COMPLETE", "filled_price": avg_price}
+                            return {"order_id": order_id, "status": "COMPLETE", "filled_price": avg_price, "filled_quantity": filled_qty or int(quantity)}
                         elif status == "REJECTED":
                             reason = last_state.get("status_message", "Unknown error")
                             self.add_log(f"🔴 [ORDER REJECTED] {tradingsymbol}: {reason}")
                             send_telegram_alert(f"🔴 <b>ORDER REJECTED</b>\n{tradingsymbol}: {reason}")
-                            return {"order_id": order_id, "status": "REJECTED", "reason": reason}
+                            return {"order_id": order_id, "status": "REJECTED", "reason": reason, "filled_quantity": filled_qty}
                         elif status == "CANCELLED":
                             self.add_log(f"⚪ [ORDER CANCELLED] {tradingsymbol} Order ID: {order_id}")
-                            return {"order_id": order_id, "status": "CANCELLED"}
+                            return {"order_id": order_id, "status": "CANCELLED", "filled_price": avg_price, "filled_quantity": filled_qty}
                 except Exception as ex:
                     print(f"Error checking order status on attempt {attempt+1}: {ex}")
                 
-            return {"order_id": order_id, "status": "OPEN", "filled_price": price or trigger_price}
+            return {"order_id": order_id, "status": "OPEN", "filled_price": params.get("price", trigger_price), "filled_quantity": 0}
         except Exception as e:
             self.add_log(f"🔴 [ORDER ERROR] {e}")
             send_telegram_alert(f"🚨 <b>ORDER FAILURE</b>\nSymbol: {symbol}\nError: {e}")
@@ -425,22 +431,21 @@ class LiveManager:
             return False
         try:
             time.sleep(0.1)
+            trig = round_to_tick(trigger_price)
+            lim = round_to_tick(price) if price > 0 else round_to_tick(trig * 1.05)
             params = {
                 "variety": self.kite.VARIETY_REGULAR,
                 "order_id": order_id,
                 "order_type": "SL",
-                "trigger_price": round(float(trigger_price), 2)
+                "trigger_price": trig,
+                "price": lim
             }
-            if price <= 0:
-                params["price"] = round(float(trigger_price) * 1.05, 2)  # 5% buffer for Buy SL
-            else:
-                params["price"] = round(float(price), 2)
                 
             if quantity is not None and int(quantity) > 0:
                 params["quantity"] = int(quantity)
                 
             self.kite.modify_order(**params)
-            self.add_log(f"🔄 [MODIFY SL ORDER] Updated Order {order_id} -> Trigger: ₹{trigger_price:.2f} (Limit: ₹{params['price']:.2f})")
+            self.add_log(f"🔄 [MODIFY SL ORDER] Updated Order {order_id} -> Trigger: ₹{trig:.2f} (Limit: ₹{lim:.2f})")
             return True
         except Exception as e:
             self.add_log(f"⚠️ [MODIFY SL NOTICE] Could not modify Order {order_id}: {e}")
@@ -449,6 +454,85 @@ class LiveManager:
     def place_zerodha_sl_order(self, symbol, quantity, trigger_price, price=0.0):
         """Places a hard Stop-Loss Limit (SL-L) order on Zerodha exchange to protect an open short position."""
         return self.place_zerodha_order(symbol, "BUY", quantity, order_type="SL", trigger_price=trigger_price, price=price)
+
+    def _get_order_snapshot(self, order_id):
+        """Fetch latest status, filled quantity, and average price for a Zerodha order."""
+        if not self.kite or not order_id:
+            return None
+        try:
+            time.sleep(0.1)
+            history = self.kite.order_history(order_id)
+            if history:
+                last = history[-1]
+                return {
+                    "status": last.get("status"),
+                    "filled_quantity": int(last.get("filled_quantity", 0) or 0),
+                    "average_price": float(last.get("average_price", 0.0) or 0.0),
+                }
+        except Exception as e:
+            print(f"Error fetching order history for {order_id}: {e}")
+        return None
+
+    def _resolve_entry_order_real(self, order_res, expected_qty):
+        """Verify entry LIMIT order fill; cancel unfilled OPEN orders so state never diverges from Zerodha."""
+        if not order_res:
+            return "ABORT", 0, 0.0
+
+        status = order_res.get("status")
+        filled_qty = int(order_res.get("filled_quantity", 0) or 0)
+        filled_price = float(order_res.get("filled_price", 0.0) or 0.0)
+
+        if status == "COMPLETE":
+            return "FILLED", (filled_qty or expected_qty), filled_price
+
+        if status == "OPEN" and order_res.get("order_id"):
+            self.cancel_zerodha_order(order_res["order_id"])
+            snap = self._get_order_snapshot(order_res["order_id"])
+            if snap:
+                filled_qty = snap["filled_quantity"]
+                if snap["average_price"] > 0:
+                    filled_price = snap["average_price"]
+                if snap["status"] == "COMPLETE" or filled_qty >= expected_qty:
+                    return "FILLED", filled_qty or expected_qty, filled_price
+
+        if filled_qty >= expected_qty:
+            return "FILLED", filled_qty, filled_price
+        if filled_qty > 0:
+            return "PARTIAL", filled_qty, filled_price
+        return "ABORT", 0, 0.0
+
+    def _close_position_real(self, symbol, qty, state, fallback_price, cancel_first=False):
+        """
+        Safely exit a real position without double-buying if the exchange SL-L order already filled.
+        Returns weighted average exit fill price.
+        """
+        sl_order_id = state.get('sl_order_id')
+        already_filled = 0
+        weighted_sum = 0.0
+
+        if sl_order_id:
+            if cancel_first:
+                self.cancel_zerodha_order(sl_order_id)
+            snap = self._get_order_snapshot(sl_order_id)
+            if snap:
+                if snap["status"] not in ("COMPLETE", "CANCELLED", "REJECTED") and not cancel_first:
+                    self.cancel_zerodha_order(sl_order_id)
+                    snap = self._get_order_snapshot(sl_order_id) or snap
+                f_qty = min(snap["filled_quantity"], qty)
+                if f_qty > 0:
+                    already_filled = f_qty
+                    fill_px = snap["average_price"] if snap["average_price"] > 0 else float(fallback_price)
+                    weighted_sum += already_filled * fill_px
+                    self.add_log(f"🛡️ [SL VERIFIED] Exchange SL order {sl_order_id} already filled {already_filled} qty @ ₹{fill_px:.2f}.")
+            state['sl_order_id'] = None
+
+        remaining_qty = max(0, qty - already_filled)
+        if remaining_qty > 0:
+            res = self.place_zerodha_order(symbol, "BUY", remaining_qty, order_type="MARKET")
+            mkt_px = float(res["filled_price"]) if res and res.get("filled_price", 0) > 0 else float(fallback_price)
+            weighted_sum += remaining_qty * mkt_px
+
+        return round(weighted_sum / qty, 2) if qty > 0 else float(fallback_price)
 
     def panic_square_off(self, reason="User Emergency Panic Button"):
         """
@@ -459,12 +543,6 @@ class LiveManager:
         current_time = self.get_current_time()
         for opt_type in ['PE', 'CE']:
             state = self.strategy_state.get(opt_type, {})
-            # Cancel any open exchange SL order first
-            sl_order_id = state.get('sl_order_id')
-            if sl_order_id:
-                self.cancel_zerodha_order(sl_order_id)
-                state['sl_order_id'] = None
-
             pos = state.get('position')
             if pos and pos != 'None':
                 strike = state.get('strike')
@@ -473,9 +551,10 @@ class LiveManager:
                 
                 if self.mode == "LIVE_REAL" and self.kite and strike:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
-                    res = self.place_zerodha_order(symbol, "BUY", qty, order_type="MARKET")
-                    if res and res.get("filled_price", 0) > 0:
-                        cmp_price = res["filled_price"]
+                    cmp_price = self._close_position_real(symbol, qty, state, cmp_price, cancel_first=True)
+                elif state.get('sl_order_id'):
+                    self.cancel_zerodha_order(state['sl_order_id'])
+                    state['sl_order_id'] = None
                         
                 pnl = (round(state.get('entry_price', 0.0), 2) - round(cmp_price, 2)) * qty
                 self.realized_pnl += pnl
@@ -620,8 +699,8 @@ class LiveManager:
             "utilization_pct": 0.0
         }
         try:
-            span_per_lot = 85000.0 * (self.lot_size / 65.0)
-            exp_per_lot = 25000.0 * (self.lot_size / 65.0)
+            span_per_lot = 135000.0 * (self.lot_size / 65.0)
+            exp_per_lot = 35000.0 * (self.lot_size / 65.0)
             single_leg_margin = span_per_lot + exp_per_lot
             
             max_pe_span = span_per_lot * 2
@@ -1302,16 +1381,22 @@ class LiveManager:
             print(f"Error fetching live account margins: {e}")
             return None
 
-    def calculate_margins(self, current_time=None):
-        # If no active positions, margin is 0
+    def calculate_margins(self, current_time=None, extra_leg=None, extra_lots=0):
         pe_pos = self.strategy_state['PE']['position']
         ce_pos = self.strategy_state['CE']['position']
-        
-        if (not pe_pos or pe_pos == 'None') and (not ce_pos or ce_pos == 'None'):
+        pe_lots = 2 if pe_pos == 'SHORT_2_LOTS' else (1 if pe_pos == 'SHORT_1_LOT' else 0)
+        ce_lots = 2 if ce_pos == 'SHORT_2_LOTS' else (1 if ce_pos == 'SHORT_1_LOT' else 0)
+
+        if extra_leg == 'PE' and extra_lots > 0 and pe_lots == 0:
+            pe_lots = extra_lots
+        elif extra_leg == 'CE' and extra_lots > 0 and ce_lots == 0:
+            ce_lots = extra_lots
+
+        if pe_lots == 0 and ce_lots == 0:
             return 0.0, 0.0
             
         now_ts = time.time()
-        cache_key = (pe_pos, ce_pos, self.strategy_state['PE']['strike'], self.strategy_state['CE']['strike'])
+        cache_key = (pe_lots, ce_lots, self.strategy_state['PE']['strike'], self.strategy_state['CE']['strike'])
         if (self._cached_calculated_margins and 
             self._cached_calculated_margins_key == cache_key and 
             (now_ts - self._cached_calculated_margins_time < 60.0)):
@@ -1330,43 +1415,22 @@ class LiveManager:
                         current_time = datetime.datetime.now(ist)
 
                 params = []
-                if pe_pos and pe_pos != 'None':
-                    pe_qty = lot_size * (2 if pe_pos == 'SHORT_2_LOTS' else 1)
-                    pe_strike = self.strategy_state['PE']['strike']
-                    symbol = self.get_option_symbol(pe_strike, 'PE', current_time) if pe_strike else None
-                    if symbol:
-                        if ":" in symbol:
-                            symbol = symbol.split(":")[1]
-                        params.append({
-                            "exchange": "NFO",
-                            "tradingsymbol": symbol,
-                            "transaction_type": "SELL",
-                            "variety": "regular",
-                            "product": "NRML",
-                            "order_type": "MARKET",
-                            "quantity": pe_qty,
-                            "price": 0,
-                            "trigger_price": 0
-                        })
-                    
-                if ce_pos and ce_pos != 'None':
-                    ce_qty = lot_size * (2 if ce_pos == 'SHORT_2_LOTS' else 1)
-                    ce_strike = self.strategy_state['CE']['strike']
-                    symbol = self.get_option_symbol(ce_strike, 'CE', current_time) if ce_strike else None
-                    if symbol:
-                        if ":" in symbol:
-                            symbol = symbol.split(":")[1]
-                        params.append({
-                            "exchange": "NFO",
-                            "tradingsymbol": symbol,
-                            "transaction_type": "SELL",
-                            "variety": "regular",
-                            "product": "NRML",
-                            "order_type": "MARKET",
-                            "quantity": ce_qty,
-                            "price": 0,
-                            "trigger_price": 0
-                        })
+                for opt, lots in (('PE', pe_lots), ('CE', ce_lots)):
+                    if lots > 0:
+                        strike = self.strategy_state[opt]['strike']
+                        symbol = self.get_option_symbol(strike, opt, current_time) if strike else None
+                        if symbol:
+                            params.append({
+                                "exchange": "NFO",
+                                "tradingsymbol": symbol.split(":")[1] if ":" in symbol else symbol,
+                                "transaction_type": "SELL",
+                                "variety": "regular",
+                                "product": "NRML",
+                                "order_type": "MARKET",
+                                "quantity": lots * lot_size,
+                                "price": 0,
+                                "trigger_price": 0
+                            })
                     
                 if params:
                     # Call Zerodha basket margins API to get combined margin with strangle benefit
@@ -1381,24 +1445,13 @@ class LiveManager:
             except Exception as e:
                 print(f"Error fetching margins from Zerodha API: {e}. Using fallback calculation.")
                 
-        # Fallback margin estimation logic:
-        # 1 lot short of Nifty option is approx ₹1,00,000 margin
-        pe_lots = 0
-        ce_lots = 0
-        if pe_pos == 'SHORT_2_LOTS': pe_lots = 2
-        elif pe_pos == 'SHORT_1_LOT': pe_lots = 1
-        if ce_pos == 'SHORT_2_LOTS': ce_lots = 2
-        elif ce_pos == 'SHORT_1_LOT': ce_lots = 1
-        
-        total_lots = pe_lots + ce_lots
-        if total_lots == 0:
-            return 0.0, 0.0
-            
-        # Strangle benefit: if both sides are short, apply a 25% discount
+        # Fallback margin estimation aligned with get_margin_metrics (Nifty ~25,750 / 65 qty):
+        span_per_lot = 135000.0 * (lot_size / 65.0)
+        exp_per_lot = 35000.0 * (lot_size / 65.0)
         if pe_lots > 0 and ce_lots > 0:
-            margin_required = total_lots * 100000.0 * 0.75
+            margin_required = max(pe_lots, ce_lots) * span_per_lot + (pe_lots + ce_lots) * exp_per_lot
         else:
-            margin_required = total_lots * 100000.0
+            margin_required = (pe_lots + ce_lots) * (span_per_lot + exp_per_lot)
             
         margin_res = (round(margin_required, 2), round(margin_required * 1.20, 2))
         self._cached_calculated_margins = margin_res
@@ -1878,16 +1931,12 @@ class LiveManager:
                 lots_closed = 2 if state['position'] == 'SHORT_2_LOTS' else 1
                 exit_price = o_price
                 
-                # Cancel open exchange SL order first
-                if state.get('sl_order_id'):
-                    self.cancel_zerodha_order(state['sl_order_id'])
-                    state['sl_order_id'] = None
-
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
-                    res = self.place_zerodha_order(symbol, "BUY", lots_closed * self.lot_size, order_type="MARKET")
-                    if res and res.get("filled_price", 0) > 0:
-                        exit_price = res["filled_price"]
+                    exit_price = self._close_position_real(symbol, lots_closed * self.lot_size, state, exit_price, cancel_first=True)
+                elif state.get('sl_order_id'):
+                    self.cancel_zerodha_order(state['sl_order_id'])
+                    state['sl_order_id'] = None
                         
                 if state['position'] == 'SHORT_2_LOTS':
                     pnl = (round(state['entry_price'], 2) - round(exit_price, 2)) * 2 * self.lot_size
@@ -1969,10 +2018,12 @@ class LiveManager:
                 if o_price <= target_entry and o_price > 0 and state.get('above_entry_threshold', False):
                     # Recommendation 1: Limit Order Fill Capping
                     entry_fill_price = round(target_entry, 2)
-                    
+                    entry_pos = 'SHORT_2_LOTS'
+                    entry_lots = 2
+
                     if self.mode == "LIVE_REAL" and self.kite:
-                        # Pre-trade Margin Verification
-                        margin_req, _ = self.calculate_margins(current_time)
+                        # Prospective Pre-trade Margin Verification (includes the new leg)
+                        margin_req, _ = self.calculate_margins(current_time, extra_leg=opt_type, extra_lots=2)
                         margins_info = self.get_live_broker_margins()
                         avail_cash = margins_info.get("available", 0.0) if margins_info else self.capital
                         if avail_cash < margin_req * 1.15:
@@ -1982,13 +2033,23 @@ class LiveManager:
                             
                         symbol = self.get_option_symbol(strike, opt_type, current_time)
                         res = self.place_zerodha_order(symbol, "SELL", 2 * self.lot_size, order_type="LIMIT", price=entry_fill_price)
-                        if res and res.get("status") == "REJECTED":
-                            self.add_log(f"🔴 Real Entry Order REJECTED. Position skipped.")
+                        outcome, filled_qty, filled_px = self._resolve_entry_order_real(res, 2 * self.lot_size)
+                        if outcome == "ABORT":
+                            self.add_log(f"🔴 Real Entry Order not filled ({res.get('status') if res else 'ERROR'}). Position skipped.")
                             return
-                        if res and res.get("filled_price", 0) > 0:
-                            entry_fill_price = res["filled_price"]
+                        if filled_px > 0:
+                            entry_fill_price = round(filled_px, 2)
+                        if outcome == "PARTIAL":
+                            if filled_qty == self.lot_size:
+                                entry_pos = 'SHORT_1_LOT'
+                                entry_lots = 1
+                                self.add_log(f"⚠️ [PARTIAL ENTRY] {opt_type} {strike} filled 1 lot ({filled_qty} qty) @ ₹{entry_fill_price:.2f}. Tracking SHORT_1_LOT.")
+                            else:
+                                self.add_log(f"🚨 [ODD PARTIAL FILL] {opt_type} {strike} filled {filled_qty} qty; flattening to avoid lot mismatch.")
+                                self.place_zerodha_order(symbol, "BUY", filled_qty, order_type="MARKET")
+                                return
                             
-                    state['position'] = 'SHORT_2_LOTS'
+                    state['position'] = entry_pos
                     state['entry_price'] = entry_fill_price
                     state['entry_count'] += 1
                     state['current_sl'] = state['day_high']
@@ -2001,13 +2062,13 @@ class LiveManager:
                     # Place immediate exchange-side Stop-Loss Limit (SL-L) order in LIVE_REAL mode
                     if self.mode == "LIVE_REAL" and self.kite:
                         symbol = self.get_option_symbol(strike, opt_type, current_time)
-                        sl_res = self.place_zerodha_sl_order(symbol, 2 * self.lot_size, trigger_price=state['current_sl'])
+                        sl_res = self.place_zerodha_sl_order(symbol, entry_lots * self.lot_size, trigger_price=state['current_sl'])
                         if sl_res and sl_res.get("order_id"):
                             state['sl_order_id'] = sl_res.get("order_id")
                             self.add_log(f"🛡️ [HARD SL ARMED] {opt_type} {strike} SL-L Order {state['sl_order_id']} active on Zerodha exchange @ ₹{state['current_sl']:.2f}")
 
-                    self.add_log(f"[ENTRY #{state['entry_count']}] Shorted 2 Lots of {opt_type} {strike} at {entry_fill_price:.2f} (SL: {state['current_sl']:.2f} | Target: {state['target']:.2f})")
-                    send_telegram_alert(f"🚀 <b>ENTRY #{state['entry_count']} TRIGGERED</b>\n{opt_type} {strike} Short 2 Lots @ ₹{entry_fill_price:.2f}\nSL: ₹{state['current_sl']:.2f} | Target: ₹{state['target']:.2f}")
+                    self.add_log(f"[ENTRY #{state['entry_count']}] Shorted {entry_lots} Lots of {opt_type} {strike} at {entry_fill_price:.2f} (SL: {state['current_sl']:.2f} | Target: {state['target']:.2f})")
+                    send_telegram_alert(f"🚀 <b>ENTRY #{state['entry_count']} TRIGGERED</b>\n{opt_type} {strike} Short {entry_lots} Lots @ ₹{entry_fill_price:.2f}\nSL: ₹{state['current_sl']:.2f} | Target: ₹{state['target']:.2f}")
                     
         elif state['position'] == 'SHORT_2_LOTS':
             state['min_price'] = min(state['min_price'], o_price)
@@ -2029,11 +2090,7 @@ class LiveManager:
                 exit_fill_price = state['current_sl']
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
-                    # If exchange SL order exists, check if it was triggered or execute fallback market buy
-                    if not state.get('sl_order_id'):
-                        res = self.place_zerodha_order(symbol, "BUY", 2 * self.lot_size, order_type="MARKET")
-                        if res and res.get("filled_price", 0) > 0:
-                            exit_fill_price = res["filled_price"]
+                    exit_fill_price = self._close_position_real(symbol, 2 * self.lot_size, state, exit_fill_price, cancel_first=False)
                         
                 pnl = (round(state['entry_price'], 2) - round(exit_fill_price, 2)) * 2 * self.lot_size
                 self.realized_pnl += pnl
@@ -2099,7 +2156,10 @@ class LiveManager:
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
                     res = self.place_zerodha_order(symbol, "BUY", 1 * self.lot_size, order_type="MARKET")
-                    if res and res.get("filled_price", 0) > 0:
+                    if not res or res.get("status") in ("REJECTED", "CANCELLED"):
+                        self.add_log(f"🔴 [TARGET EXIT FAILED] {opt_type} {strike} Lot 1 exit failed ({res.get('status') if res else 'ERROR'}). Keeping SHORT_2_LOTS.")
+                        return
+                    if res.get("filled_price", 0) > 0:
                         exit_fill_price = res["filled_price"]
                         
                 pnl = (round(state['entry_price'], 2) - round(exit_fill_price, 2)) * self.lot_size
@@ -2150,10 +2210,7 @@ class LiveManager:
                 exit_fill_price = state['current_sl']
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
-                    if not state.get('sl_order_id'):
-                        res = self.place_zerodha_order(symbol, "BUY", 1 * self.lot_size, order_type="MARKET")
-                        if res and res.get("filled_price", 0) > 0:
-                            exit_fill_price = res["filled_price"]
+                    exit_fill_price = self._close_position_real(symbol, 1 * self.lot_size, state, exit_fill_price, cancel_first=False)
                         
                 pnl = (round(state['entry_price'], 2) - round(exit_fill_price, 2)) * self.lot_size
                 self.realized_pnl += pnl

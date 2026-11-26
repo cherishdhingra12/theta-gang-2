@@ -20,8 +20,10 @@ class TestLiveFeedEngine(unittest.TestCase):
         self.test_dir = tempfile.TemporaryDirectory()
         self.orig_trades_path = live_feed.TRADES_PATH
         self.orig_state_path = live_feed.LIVE_STATE_PATH
+        self.orig_symbol_path = live_feed.SYMBOL_KNOWLEDGE_PATH
         live_feed.TRADES_PATH = os.path.join(self.test_dir.name, "live_trades.json")
         live_feed.LIVE_STATE_PATH = os.path.join(self.test_dir.name, "live_state.json")
+        live_feed.SYMBOL_KNOWLEDGE_PATH = os.path.join(self.test_dir.name, "symbol_knowledge.json")
 
         # Sample mockup response from the NSE Option Chain API
         self.mock_option_chain_data = {
@@ -77,6 +79,7 @@ class TestLiveFeedEngine(unittest.TestCase):
     def tearDown(self):
         live_feed.TRADES_PATH = self.orig_trades_path
         live_feed.LIVE_STATE_PATH = self.orig_state_path
+        live_feed.SYMBOL_KNOWLEDGE_PATH = self.orig_symbol_path
         self.test_dir.cleanup()
 
     def test_live_manager_mock_lifecycle(self):
@@ -741,6 +744,189 @@ class TestLiveFeedEngine(unittest.TestCase):
         }
         manager._evaluate_strategy_for_leg('PE', 176.0, 176.0, 176.0, t)
         self.assertIsNone(manager.strategy_state['PE']['position']) # NOT triggered
+
+    def test_round_to_tick_and_zerodha_order_prices(self):
+        """Phase 1: Enforce NSE 0.05 tick-size rounding on LIMIT and SL-L prices."""
+        self.assertEqual(live_feed.round_to_tick(296.13), 296.15)
+        self.assertEqual(live_feed.round_to_tick(296.12), 296.10)
+        self.assertEqual(live_feed.round_to_tick(0.0), 0.0)
+
+        manager = LiveManager()
+        mock_kite = MagicMock()
+        mock_kite.VARIETY_REGULAR = "regular"
+        mock_kite.EXCHANGE_NFO = "NFO"
+        mock_kite.PRODUCT_NRML = "NRML"
+        mock_kite.place_order.return_value = "ORD_1"
+        mock_kite.order_history.return_value = [{"status": "COMPLETE", "average_price": 296.15, "filled_quantity": 130}]
+        manager.kite = mock_kite
+
+        with patch('time.sleep'):
+            manager.place_zerodha_order("NFO:NIFTY26NOV25650CE", "SELL", 130, order_type="LIMIT", price=296.13)
+        limit_kwargs = mock_kite.place_order.call_args.kwargs
+        self.assertEqual(limit_kwargs["price"], 296.15)
+
+        with patch('time.sleep'):
+            manager.place_zerodha_sl_order("NFO:NIFTY26NOV25650CE", 130, trigger_price=329.03)
+        sl_kwargs = mock_kite.place_order.call_args.kwargs
+        self.assertEqual(sl_kwargs["trigger_price"], 329.05)
+        self.assertEqual(round((sl_kwargs["price"] * 20) % 1, 6), 0.0)
+
+        with patch('time.sleep'):
+            manager.modify_zerodha_sl_order("ORD_SL", trigger_price=263.24, quantity=65)
+        mod_kwargs = mock_kite.modify_order.call_args.kwargs
+        self.assertEqual(mod_kwargs["trigger_price"], 263.25)
+        self.assertEqual(round((mod_kwargs["price"] * 20) % 1, 6), 0.0)
+
+    def test_live_real_open_entry_aborts_without_sl(self):
+        """Phase 1: Unfilled OPEN LIMIT SELL must cancel cleanly and never arm an exchange BUY SL."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.capital = 650000.0
+        manager.entry_discount = 0.10
+        manager.lot_1_target_pct = 0.40
+        manager.max_reentries = 5
+        manager.lot_size = 65
+
+        mock_kite = MagicMock()
+        mock_kite.VARIETY_REGULAR = "regular"
+        mock_kite.EXCHANGE_NFO = "NFO"
+        mock_kite.PRODUCT_NRML = "NRML"
+        mock_kite.margins.return_value = {"available": {"live_balance": 650000.0}, "utilised": {"debits": 0.0}}
+        mock_kite.basket_order_margins.return_value = {"initial": {"total": 350000.0}}
+        mock_kite.place_order.return_value = "ORD_OPEN_1"
+        mock_kite.order_history.return_value = [{"status": "OPEN", "average_price": 0.0, "filled_quantity": 0}]
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25650CE")
+        manager.strategy_state = {
+            'PE': {'strike': 25850, 'position': None},
+            'CE': {
+                'strike': 25650, 'day_high': 329.0, 'entry_count': 0, 'position': None,
+                'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'),
+                'unrealized': 0.0, 'price': 300.0, 'entry_time': None,
+                'above_entry_threshold': True, 'recent_sl_times': [], 'cooldown_until': None
+            }
+        }
+
+        t = datetime.datetime(2026, 11, 26, 10, 0, 0)
+        with patch('time.sleep'):
+            manager._evaluate_strategy_for_leg('CE', 295.0, 295.0, 295.0, t)
+
+        self.assertIsNone(manager.strategy_state['CE']['position'])
+        self.assertEqual(manager.strategy_state['CE']['entry_count'], 0)
+        self.assertIsNone(manager.strategy_state['CE'].get('sl_order_id'))
+        mock_kite.cancel_order.assert_called_once()
+        self.assertEqual(mock_kite.place_order.call_count, 1)  # Only the entry SELL; never placed BUY SL
+
+    def test_live_real_partial_entry_tracks_single_lot(self):
+        """Phase 1: Partial 1-lot fill on LIMIT SELL transitions cleanly to SHORT_1_LOT with 1-lot SL."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.capital = 650000.0
+        manager.entry_discount = 0.10
+        manager.lot_1_target_pct = 0.40
+        manager.max_reentries = 5
+        manager.lot_size = 65
+
+        mock_kite = MagicMock()
+        mock_kite.VARIETY_REGULAR = "regular"
+        mock_kite.EXCHANGE_NFO = "NFO"
+        mock_kite.PRODUCT_NRML = "NRML"
+        mock_kite.margins.return_value = {"available": {"live_balance": 650000.0}, "utilised": {"debits": 0.0}}
+        mock_kite.basket_order_margins.return_value = {"initial": {"total": 350000.0}}
+        mock_kite.place_order.side_effect = ["ORD_PARTIAL", "ORD_SL_1LOT"]
+        # First 6 polls -> OPEN, after cancel -> CANCELLED with 65 filled, then SL order COMPLETE/OPEN
+        mock_kite.order_history.side_effect = (
+            [[{"status": "OPEN", "filled_quantity": 0, "average_price": 0.0}] for _ in range(6)]
+            + [[{"status": "CANCELLED", "filled_quantity": 65, "average_price": 296.10}]]
+            + [[{"status": "OPEN", "filled_quantity": 0, "average_price": 0.0}] for _ in range(6)]
+        )
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25650CE")
+        manager.strategy_state = {
+            'PE': {'strike': 25850, 'position': None},
+            'CE': {
+                'strike': 25650, 'day_high': 329.0, 'entry_count': 0, 'position': None,
+                'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'),
+                'unrealized': 0.0, 'price': 300.0, 'entry_time': None,
+                'above_entry_threshold': True, 'recent_sl_times': [], 'cooldown_until': None
+            }
+        }
+
+        t = datetime.datetime(2026, 11, 26, 10, 0, 0)
+        with patch('time.sleep'):
+            manager._evaluate_strategy_for_leg('CE', 295.0, 295.0, 295.0, t)
+
+        ce = manager.strategy_state['CE']
+        self.assertEqual(ce['position'], 'SHORT_1_LOT')
+        self.assertEqual(ce['entry_price'], 296.10)
+        self.assertEqual(ce['sl_order_id'], "ORD_SL_1LOT")
+        sl_call = mock_kite.place_order.call_args_list[1].kwargs
+        self.assertEqual(sl_call['quantity'], 65)
+        self.assertEqual(sl_call['transaction_type'], "BUY")
+
+    def test_live_real_square_off_skips_double_buy_when_sl_already_filled(self):
+        """Phase 1: 15:15 square-off must not place a duplicate MARKET BUY if exchange SL-L already filled."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.lot_size = 65
+        manager.realized_pnl = 0.0
+
+        mock_kite = MagicMock()
+        mock_kite.VARIETY_REGULAR = "regular"
+        mock_kite.cancel_order.side_effect = Exception("Order already completed")
+        mock_kite.order_history.return_value = [{"status": "COMPLETE", "filled_quantity": 130, "average_price": 329.0}]
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25650CE")
+        manager.strategy_state = {
+            'PE': {'strike': 25850, 'position': None},
+            'CE': {
+                'strike': 25650, 'day_high': 329.0, 'entry_count': 1, 'position': 'SHORT_2_LOTS',
+                'entry_price': 296.10, 'current_sl': 329.0, 'target': 197.40, 'min_price': 296.10,
+                'unrealized': 0.0, 'price': 328.0, 'entry_time': '09:38:36',
+                'above_entry_threshold': True, 'sl_order_id': 'ORD_SL_FILLED',
+                'recent_sl_times': [], 'cooldown_until': None
+            }
+        }
+
+        t = datetime.datetime(2026, 11, 26, 15, 15, 5)
+        with patch('time.sleep'):
+            manager._evaluate_strategy_for_leg('CE', 328.0, 328.0, 328.0, t)
+
+        mock_kite.place_order.assert_not_called()
+        self.assertIsNone(manager.strategy_state['CE']['position'])
+        self.assertAlmostEqual(manager.realized_pnl, (296.10 - 329.0) * 130, places=2)
+
+    def test_live_real_prospective_margin_blocks_underfunded_first_entry(self):
+        """Phase 1: Pre-trade margin check includes prospective leg and blocks underfunded initial entry."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.capital = 200000.0
+        manager.entry_discount = 0.10
+        manager.lot_1_target_pct = 0.40
+        manager.max_reentries = 5
+        manager.lot_size = 65
+
+        mock_kite = MagicMock()
+        mock_kite.margins.return_value = {"available": {"live_balance": 200000.0}, "utilised": {"debits": 0.0}}
+        mock_kite.basket_order_margins.return_value = {"initial": {"total": 350000.0}}
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25850PE")
+        manager.strategy_state = {
+            'PE': {
+                'strike': 25850, 'day_high': 300.0, 'entry_count': 0, 'position': None,
+                'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'),
+                'unrealized': 0.0, 'price': 280.0, 'entry_time': None,
+                'above_entry_threshold': True, 'recent_sl_times': [], 'cooldown_until': None
+            },
+            'CE': {'strike': 25650, 'position': None}
+        }
+
+        t = datetime.datetime(2026, 11, 26, 9, 45, 0)
+        with patch('time.sleep'):
+            manager._evaluate_strategy_for_leg('PE', 269.0, 269.0, 269.0, t)
+
+        self.assertIsNone(manager.strategy_state['PE']['position'])
+        mock_kite.place_order.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()

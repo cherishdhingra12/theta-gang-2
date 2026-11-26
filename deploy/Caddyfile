@@ -1,0 +1,5 @@
+# Reverse proxy template for Theta Gang 2 Dashboard (port 5001)
+# Replace your-domain.example.com with your VPS domain (or use :443 with tls internal for VPN/Tailscale).
+your-domain.example.com {
+    reverse_proxy 127.0.0.1:5001
+}
