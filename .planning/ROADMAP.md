@@ -15,7 +15,7 @@
 - [x] Run empirical + 1-month spot backtest comparison in `.planning/PHASE2_ANALYSIS.md` (`PE_SELL` PF `2.00` / MaxDD `1.35%` vs `BOTH` PF `1.29` / MaxDD `3.80%`).
 - [ ] Accumulate 10–15 `LIVE` forward sessions on Nov 23 safeguards before switching `config.json` to `LIVE_REAL`.
 
-### Phase 3: Security & Controlled Real-Money Rollout *(Artifacts Prepared; Execute Post-Market When Ready to Fund)*
+### Phase 3: Security & Controlled Real-Money Rollout *(Artifacts Prepared; Deployed Phase 1 Post-Market)*
 - [x] Add HTTPS reverse proxy template (`deploy/Caddyfile`) and step-by-step rollout checklist (`deploy/PHASE3_ROLLOUT.md`).
-- [ ] Deploy Phase 1 code to Oracle VPS (`140.238.241.115`) **after 15:30 IST** (post-market, 0 open positions).
-- [ ] Enable HTTPS/SSH tunnel for dashboard access, verify live `basket_order_margins()` with funded capital (`₹4.25L–₹4.50L` for `PE_SELL` or `₹6.00L–₹6.50L` for `BOTH`), and start 2-week `LIVE_REAL` burn-in.
+- [x] Deploy Phase 1 code to Oracle VPS (`140.238.241.115`) post-market (Nov 26 `16:02 IST`, 35/35 VPS tests passing, `nifty-bot.service` healthy).
+- [ ] Enable HTTPS/SSH tunnel for dashboard access, verify live `basket_order_margins()` with funded capital (`₹4.25L–₹4.50L` for `PE_SELL` or `₹6.00L–₹6.50L` for `BOTH`), and start 2-week `LIVE_REAL` burn-in after the 15-session `BOTH` surveillance window.

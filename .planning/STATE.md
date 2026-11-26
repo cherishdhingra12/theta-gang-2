@@ -1,6 +1,7 @@
 # Project State
 
-- **Current Milestone**: Phase 1 Completed & Verified (33/33 tests passing); Phase 2 Backtest Complete; Phase 3 Rollout Artifacts Ready
-- **Live VPS Status**: Untouched during live market hours (`2026-11-26 14:03 IST`); deploy post-market (`> 15:30 IST`)
-- **Recommended `LIVE_REAL` Starter Config**: `strategy_type="PE_SELL"` (`₹4.25L–₹4.50L` funded) or `BOTH` with `max_reentries=3` (`₹6.00L–₹6.50L` funded)
+- **Current Milestone**: Phase 1 + Risk Shields Deployed to Oracle VPS (`140.238.241.115`); 15-Session `LIVE` (`BOTH`) Surveillance Active
+- **Verified Commit**: `8f8a65c` (35/35 unit tests passing on VPS, 311 live trades intact)
+- **Nov 26 Session Summary**: +₹16,638.70 gross (PE +₹10,696.40 | CE +₹5,942.30) — both legs flat at close
+- **Next Gate**: Review `PE` vs `CE` net expectancy after ~15 live sessions before enabling `LIVE_REAL`
 - **Date**: 2026-11-26
