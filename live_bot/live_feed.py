@@ -122,8 +122,10 @@ def load_strategy_config():
         "r": 7.0,
         "runaway_block_pct": 50.0,
         "runaway_unlock_on_reversion": True,
-        "enable_2sl_trend_freeze": True,
+        "enable_2sl_trend_freeze": False,
         "realistic_paper_sl_fill": True,
+        "daily_loss_limit_pct": 6.0,
+        "resting_limit_entries": True,
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -154,7 +156,7 @@ def save_strategy_config(config_data):
         for ckey, env_var in cred_mapping.items():
             if ckey in clean_config:
                 val = clean_config.pop(ckey)
-                if val:
+                if val and str(val) != "********":
                     os.environ[env_var] = str(val)
                     env_updates[env_var] = str(val)
 
@@ -302,12 +304,15 @@ class LiveManager:
         self.lot_size = 65
         self.iv = 0.15
         self.r = 0.07
-        # Cross-pollinated risk shields & realistic paper fills (independent OPTIONS SELLING learnings)
+        # Risk shields & realistic execution settings
         self.runaway_block_pct = 0.50
         self.runaway_unlock_on_reversion = True
-        self.enable_2sl_trend_freeze = True
+        self.enable_2sl_trend_freeze = False
         self.realistic_paper_sl_fill = True
+        self.daily_loss_limit_pct = 0.06
+        self.resting_limit_entries = True
         self.last_peak_reconcile_time = 0.0
+        self.last_sl_sync_time = 0.0
         
         # Current execution state
         self.spot_price = 0.0
@@ -346,12 +351,12 @@ class LiveManager:
         self.last_watchdog_heal_time = 0.0
         self.consecutive_heal_attempts = {}
 
-    def place_zerodha_order(self, symbol, transaction_type, quantity, order_type="MARKET", trigger_price=0.0, price=0.0):
+    def place_zerodha_order(self, symbol, transaction_type, quantity, order_type="MARKET", trigger_price=0.0, price=0.0, wait_polls=6):
         """
         Executes real order placement on Zerodha KiteConnect for LIVE_REAL mode.
         Complies with Zerodha 10 OPS rate limits, SL-M restrictions (uses SL-L with limit buffer),
         and market protection parameters.
-        Includes multi-try status verification polling (up to 3 seconds).
+        Includes multi-try status verification polling (default 6 attempts / ~3 seconds; 0 for non-blocking resting LIMIT orders).
         """
         if not self.kite:
             self.add_log("🔴 Order placement failed: Zerodha client not connected.")
@@ -391,8 +396,8 @@ class LiveManager:
             order_id = self.kite.place_order(**params)
             self.add_log(f"✅ [REAL ORDER SUBMITTED] Order ID: {order_id}")
             
-            # Active status verification polling (up to 6 attempts across ~3 seconds)
-            for attempt in range(6):
+            # Active status verification polling
+            for attempt in range(int(wait_polls)):
                 time.sleep(0.5)
                 try:
                     history = self.kite.order_history(order_id)
@@ -544,6 +549,239 @@ class LiveManager:
 
         return round(weighted_sum / qty, 2) if qty > 0 else float(fallback_price)
 
+    def _modify_limit_order_price(self, order_id, price):
+        """Modify an open resting LIMIT entry order's price (rounded to 0.05 tick)."""
+        if not self.kite or not order_id:
+            return False
+        try:
+            time.sleep(0.1)
+            lim = round_to_tick(price)
+            self.kite.modify_order(
+                variety=self.kite.VARIETY_REGULAR,
+                order_id=order_id,
+                order_type="LIMIT",
+                price=lim
+            )
+            self.add_log(f"🔄 [RESTING LIMIT UPDATED] Order {order_id} -> ₹{lim:.2f}")
+            return True
+        except Exception as e:
+            self.add_log(f"⚠️ [RESTING LIMIT MODIFY NOTICE] Order {order_id}: {e}")
+            return False
+
+    def _sync_exchange_sl_order(self, opt_type, strike, qty, trigger_price, current_time, state):
+        """
+        Update exchange SL-L trigger/qty; if modify fails and order is still active, cancel & re-place
+        so qty never stays mismatched (preventing accidental naked-long flips on Target Lot 1).
+        """
+        sl_id = state.get('sl_order_id')
+        if not (self.mode == "LIVE_REAL" and self.kite and sl_id):
+            return True
+
+        if self.modify_zerodha_sl_order(sl_id, trigger_price=trigger_price, quantity=qty):
+            return True
+
+        snap = self._get_order_snapshot(sl_id)
+        if snap and snap["status"] == "COMPLETE":
+            fill_px = snap["average_price"] if snap["average_price"] > 0 else float(trigger_price)
+            self.add_log(f"⚠️ [SL FILLED DURING MODIFY] {opt_type} {strike} SL order {sl_id} filled @ ₹{fill_px:.2f}. Reconciling leg.")
+            self._finalize_sl_exit(opt_type, strike, state, fill_px, current_time)
+            return False
+
+        # Cancel stale SL and replace with exact target qty & trigger
+        self.cancel_zerodha_order(sl_id)
+        post_cancel = self._get_order_snapshot(sl_id)
+        if post_cancel and post_cancel["filled_quantity"] > 0:
+            fill_px = post_cancel["average_price"] if post_cancel["average_price"] > 0 else float(trigger_price)
+            self._finalize_sl_exit(opt_type, strike, state, fill_px, current_time)
+            return False
+
+        symbol = self.get_option_symbol(strike, opt_type, current_time)
+        new_sl_res = self.place_zerodha_sl_order(symbol, qty, trigger_price=trigger_price)
+        if new_sl_res and new_sl_res.get("order_id"):
+            state['sl_order_id'] = new_sl_res["order_id"]
+            self.add_log(f"🛡️ [HARD SL REPLACED] {opt_type} {strike} fresh SL-L {state['sl_order_id']} ({qty} qty) @ ₹{round_to_tick(trigger_price):.2f}")
+            return True
+
+        state['sl_order_id'] = None
+        self.add_log(f"🚨 [CRITICAL SL FALLBACK FAILED] Could not re-arm SL-L for {opt_type} {strike} ({qty} qty)!")
+        send_telegram_alert(f"🚨 <b>CRITICAL: SL RE-ARM FAILED</b>\n{opt_type} {strike} ({qty} qty) unprotected!")
+        return False
+
+    def _record_sl_outcome(self, state, opt_type, pnl, current_time):
+        """Track consecutive losing SLs (breakeven/shifted SLs with pnl >= 0 do not penalize)."""
+        if pnl >= 0:
+            return
+
+        state['consec_sl'] = state.get('consec_sl', 0) + 1
+        if getattr(self, 'enable_2sl_trend_freeze', False) and state['consec_sl'] >= 2:
+            state['trend_frozen'] = True
+            self.add_log(f"🧊 [2-SL TREND FREEZE] {opt_type} hit {state['consec_sl']} consecutive SLs. Freezing {opt_type} entries for today.")
+            send_telegram_alert(f"🧊 <b>2-SL TREND FREEZE</b>\n{opt_type} hit 2 consecutive Stop Losses. Freezing {opt_type} for remainder of day.")
+
+        sl_list = state.get('recent_sl_times', [])
+        clean_sl_list = []
+        for t in sl_list:
+            if isinstance(t, str):
+                try:
+                    t_dt = datetime.datetime.fromisoformat(t)
+                except Exception:
+                    continue
+            else:
+                t_dt = t
+            if hasattr(current_time, 'tzinfo') and current_time.tzinfo is not None and t_dt.tzinfo is None:
+                t_dt = current_time.tzinfo.localize(t_dt)
+            elif hasattr(current_time, 'tzinfo') and current_time.tzinfo is None and t_dt.tzinfo is not None:
+                t_dt = t_dt.replace(tzinfo=None)
+            if hasattr(current_time, '__sub__') and (current_time - t_dt).total_seconds() <= 90 * 60:
+                clean_sl_list.append(t_dt)
+        clean_sl_list.append(current_time)
+
+        if len(clean_sl_list) >= 3:
+            state['cooldown_until'] = current_time + datetime.timedelta(minutes=45)
+            state['recent_sl_times'] = []
+            cooldown_str = state['cooldown_until'].strftime('%H:%M:%S')
+            self.add_log(f"⚠️ [CIRCUIT BREAKER] {opt_type} triggered 3 consecutive Stop Losses within 90 minutes. Entering 45-minute cooldown until {cooldown_str}.")
+            send_telegram_alert(f"⚠️ <b>CONSECUTIVE LOSS CIRCUIT BREAKER</b>\n{opt_type} triggered 3 consecutive Stop Losses within 90 minutes.\nPausing {opt_type} entries for 45 minutes until {cooldown_str}.")
+        else:
+            state['recent_sl_times'] = clean_sl_list
+
+    def _finalize_sl_exit(self, opt_type, strike, state, exit_fill_price, current_time):
+        """Record SL exit trade, update realized PnL, clear position, and update loss cooldown trackers."""
+        pos = state.get('position')
+        if not pos:
+            return 0.0
+        lots = 2 if pos == 'SHORT_2_LOTS' else 1
+        pnl = (round(state['entry_price'], 2) - round(exit_fill_price, 2)) * lots * self.lot_size
+        self.realized_pnl += pnl
+
+        if pos == 'SHORT_1_LOT':
+            reason = "Trailing Stop Loss"
+        else:
+            reason = "Stop Loss (Shifted)" if state['current_sl'] < state['day_high'] else "Stop Loss (Initial)"
+
+        save_live_trade({
+            "date": current_time.strftime('%Y-%m-%d'),
+            "type": opt_type,
+            "strike": strike,
+            "lots": lots,
+            "entry_time": state['entry_time'] or "09:30:00",
+            "entry_price": round(state['entry_price'], 2),
+            "exit_time": current_time.strftime('%H:%M:%S'),
+            "exit_price": round(exit_fill_price, 2),
+            "sl": round(state['current_sl'], 2),
+            "day_high": round(state['day_high'], 2),
+            "pnl": round(pnl, 2),
+            "reason": reason
+        })
+
+        state['position'] = None
+        state['unrealized'] = 0.0
+        state['above_entry_threshold'] = None
+        state['sl_order_id'] = None
+
+        self.add_log(f"[{reason.upper()}] {opt_type} SL hit at {exit_fill_price:.2f} (PnL: ₹{pnl:.2f})")
+        send_telegram_alert(f"🛑 <b>{reason.upper()} HIT</b>\n{opt_type} {strike} Closed @ ₹{exit_fill_price:.2f}\nPnL: ₹{pnl:.2f}")
+        self._record_sl_outcome(state, opt_type, pnl, current_time)
+        return pnl
+
+    def _activate_filled_entry(self, opt_type, strike, state, entry_fill_price, entry_lots, current_time):
+        """Commit an entry fill into state and arm exchange-side SL-L protection in LIVE_REAL."""
+        state['position'] = 'SHORT_1_LOT' if entry_lots == 1 else 'SHORT_2_LOTS'
+        state['entry_price'] = round(entry_fill_price, 2)
+        state['entry_count'] += 1
+        state['current_sl'] = state['day_high']
+        state['target'] = state['day_high'] * (1.0 - self.lot_1_target_pct)
+        state['min_price'] = state['entry_price']
+        state['entry_time'] = current_time.strftime('%H:%M:%S')
+        state['above_entry_threshold'] = None
+        state['sl_order_id'] = None
+        state['entry_order_id'] = None
+        state['entry_order_price'] = 0.0
+
+        if self.mode == "LIVE_REAL" and self.kite:
+            symbol = self.get_option_symbol(strike, opt_type, current_time)
+            sl_res = self.place_zerodha_sl_order(symbol, entry_lots * self.lot_size, trigger_price=state['current_sl'])
+            if sl_res and sl_res.get("order_id"):
+                state['sl_order_id'] = sl_res.get("order_id")
+                self.add_log(f"🛡️ [HARD SL ARMED] {opt_type} {strike} SL-L Order {state['sl_order_id']} active on Zerodha exchange @ ₹{round_to_tick(state['current_sl']):.2f}")
+
+        self.add_log(f"[ENTRY #{state['entry_count']}] Shorted {entry_lots} Lots of {opt_type} {strike} at {state['entry_price']:.2f} (SL: {state['current_sl']:.2f} | Target: {state['target']:.2f})")
+        send_telegram_alert(f"🚀 <b>ENTRY #{state['entry_count']} TRIGGERED</b>\n{opt_type} {strike} Short {entry_lots} Lots @ ₹{state['entry_price']:.2f}\nSL: ₹{state['current_sl']:.2f} | Target: ₹{state['target']:.2f}")
+
+    def _cancel_resting_entry(self, opt_type, strike, state, current_time):
+        """Cancel an open resting LIMIT SELL order, or activate it if it filled right before cancel."""
+        ord_id = state.get('entry_order_id')
+        if not ord_id or not self.kite:
+            state['entry_order_id'] = None
+            state['entry_order_price'] = 0.0
+            return False
+
+        self.cancel_zerodha_order(ord_id)
+        snap = self._get_order_snapshot(ord_id)
+        state['entry_order_id'] = None
+        state['entry_order_price'] = 0.0
+        if snap and snap["filled_quantity"] > 0:
+            fill_px = snap["average_price"] if snap["average_price"] > 0 else round(state['day_high'] * (1.0 - self.entry_discount), 2)
+            filled_qty = snap["filled_quantity"]
+            if filled_qty >= 2 * self.lot_size:
+                self._activate_filled_entry(opt_type, strike, state, fill_px, 2, current_time)
+                return True
+            elif filled_qty == self.lot_size:
+                self._activate_filled_entry(opt_type, strike, state, fill_px, 1, current_time)
+                return True
+            else:
+                symbol = self.get_option_symbol(strike, opt_type, current_time)
+                self.place_zerodha_order(symbol, "BUY", filled_qty, order_type="MARKET")
+        return False
+
+    def _sync_active_sl_orders(self, current_time):
+        """Every 20s in LIVE_REAL, verify active exchange SL-L orders in case one filled between ticks."""
+        if self.mode != "LIVE_REAL" or not self.kite:
+            return
+        now_mono = time.time()
+        if now_mono - getattr(self, 'last_sl_sync_time', 0.0) < 20.0:
+            return
+        self.last_sl_sync_time = now_mono
+
+        for opt_type in ['PE', 'CE']:
+            st = self.strategy_state.get(opt_type, {})
+            pos = st.get('position')
+            sl_id = st.get('sl_order_id')
+            strike = st.get('strike')
+            if pos and sl_id and strike:
+                expected_qty = self.lot_size * (2 if pos == 'SHORT_2_LOTS' else 1)
+                snap = self._get_order_snapshot(sl_id)
+                if snap and snap["status"] == "COMPLETE" and snap["filled_quantity"] >= expected_qty:
+                    fill_px = snap["average_price"] if snap["average_price"] > 0 else st.get('current_sl', 0.0)
+                    self.add_log(f"🛡️ [BG SL SYNC] Detected filled exchange SL {sl_id} for {opt_type} {strike} @ ₹{fill_px:.2f}.")
+                    self._finalize_sl_exit(opt_type, strike, st, fill_px, current_time)
+
+    def _reconcile_broker_state_on_sync(self, current_time):
+        """Reconcile restored state against live Zerodha orders after a mid-day process restart."""
+        if self.mode != "LIVE_REAL" or not self.kite:
+            return
+        for opt_type in ['PE', 'CE']:
+            st = self.strategy_state.get(opt_type, {})
+            strike = st.get('strike')
+            if not strike:
+                continue
+            # 1. Check if a restored SL-L already filled while offline
+            if st.get('position') and st.get('sl_order_id'):
+                expected_qty = self.lot_size * (2 if st['position'] == 'SHORT_2_LOTS' else 1)
+                snap = self._get_order_snapshot(st['sl_order_id'])
+                if snap and snap["status"] == "COMPLETE" and snap["filled_quantity"] >= expected_qty:
+                    fill_px = snap["average_price"] if snap["average_price"] > 0 else st.get('current_sl', 0.0)
+                    self.add_log(f"🔄 [RESTART RECONCILE] Restored SL {st['sl_order_id']} already filled @ ₹{fill_px:.2f}.")
+                    self._finalize_sl_exit(opt_type, strike, st, fill_px, current_time)
+            # 2. Check if a restored resting entry order filled while offline
+            elif not st.get('position') and st.get('entry_order_id'):
+                snap = self._get_order_snapshot(st['entry_order_id'])
+                if snap and snap["status"] == "COMPLETE" and snap["filled_quantity"] > 0:
+                    fill_px = snap["average_price"] if snap["average_price"] > 0 else st.get('entry_order_price', 0.0)
+                    lots = 1 if snap["filled_quantity"] == self.lot_size else 2
+                    self.add_log(f"🔄 [RESTART RECONCILE] Restored entry {st['entry_order_id']} filled @ ₹{fill_px:.2f}.")
+                    self._activate_filled_entry(opt_type, strike, st, fill_px, lots, current_time)
+
     def panic_square_off(self, reason="User Emergency Panic Button"):
         """
         One-click emergency square-off: cancels all open exchange SL orders, places market buyback orders
@@ -553,6 +791,8 @@ class LiveManager:
         current_time = self.get_current_time()
         for opt_type in ['PE', 'CE']:
             state = self.strategy_state.get(opt_type, {})
+            if self.mode == "LIVE_REAL" and self.kite and state.get('entry_order_id') and state.get('strike'):
+                self._cancel_resting_entry(opt_type, state['strike'], state, current_time)
             pos = state.get('position')
             if pos and pos != 'None':
                 strike = state.get('strike')
@@ -1492,9 +1732,12 @@ class LiveManager:
             config = load_strategy_config()
             self.runaway_block_pct = float(config.get('runaway_block_pct', 50.0)) / 100.0
             self.runaway_unlock_on_reversion = bool(config.get('runaway_unlock_on_reversion', True))
-            self.enable_2sl_trend_freeze = bool(config.get('enable_2sl_trend_freeze', True))
+            self.enable_2sl_trend_freeze = bool(config.get('enable_2sl_trend_freeze', False))
             self.realistic_paper_sl_fill = bool(config.get('realistic_paper_sl_fill', True))
+            self.daily_loss_limit_pct = float(config.get('daily_loss_limit_pct', 6.0)) / 100.0
+            self.resting_limit_entries = bool(config.get('resting_limit_entries', True))
             self.last_peak_reconcile_time = 0.0
+            self.last_sl_sync_time = 0.0
             # Determine if Zerodha is configured
             api_key = config.get('kite_api_key', '')
             api_secret = config.get('kite_api_secret', '')
@@ -1512,8 +1755,8 @@ class LiveManager:
             
             # Initialize Strategy State
             self.strategy_state = {
-                'PE': {'day_high': 0.0, 'open_premium': 0.0, 'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None},
-                'CE': {'day_high': 0.0, 'open_premium': 0.0, 'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None}
+                'PE': {'day_high': 0.0, 'open_premium': 0.0, 'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'entry_order_id': None, 'entry_order_price': 0.0, 'recent_sl_times': [], 'cooldown_until': None},
+                'CE': {'day_high': 0.0, 'open_premium': 0.0, 'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'entry_order_id': None, 'entry_order_price': 0.0, 'recent_sl_times': [], 'cooldown_until': None}
             }
             
             # Setup simulated clock for Mock Mode
@@ -1555,9 +1798,12 @@ class LiveManager:
             self.add_log("Session Stopped.")
             self.broadcast({"event": "status", "status": "STOPPED", "log": "Session Stopped."})
             
-            # Square off positions in logs
+            # Square off positions / cancel resting orders on stop
+            stop_dt = self.get_current_time()
             for opt_type in ['PE', 'CE']:
                 state = self.strategy_state.get(opt_type, {})
+                if self.mode == "LIVE_REAL" and self.kite and state.get('entry_order_id') and state.get('strike'):
+                    self._cancel_resting_entry(opt_type, state['strike'], state, stop_dt)
                 if state.get('position') is not None:
                     self.add_log(f"Square-off: Closed {opt_type} position on stop.")
             
@@ -1815,6 +2061,11 @@ class LiveManager:
                         leg['consec_sl'] = int(s_leg['consec_sl'] or 0)
                     if 'trend_frozen' in s_leg:
                         leg['trend_frozen'] = bool(s_leg['trend_frozen'])
+                    if s_leg.get('sl_order_id'):
+                        leg['sl_order_id'] = s_leg.get('sl_order_id')
+                    if s_leg.get('entry_order_id'):
+                        leg['entry_order_id'] = s_leg.get('entry_order_id')
+                        leg['entry_order_price'] = float(s_leg.get('entry_order_price', 0.0) or 0.0)
                     if s_leg.get('position'):
                         leg['position'] = s_leg['position']
                         leg['entry_price'] = s_leg.get('entry_price', 0.0)
@@ -1826,7 +2077,8 @@ class LiveManager:
                         if s_leg.get('day_high', 0.0) > leg.get('day_high', 0.0):
                             leg['day_high'] = s_leg['day_high']
                         restored_legs.add(opt_type)
-                        self.add_log(f"[Sync] Restored in-flight {opt_type} position: {leg['position']} @ ₹{leg['entry_price']:.2f} (Entry: {leg['entry_time']})")
+                        self.add_log(f"[Sync] Restored in-flight {opt_type} position: {leg['position']} @ ₹{leg['entry_price']:.2f} (Entry: {leg['entry_time']}, SL ID: {leg.get('sl_order_id')})")
+                self._reconcile_broker_state_on_sync(current_time)
                 if saved_state.get('logs') and len(self.logs) <= 5:
                     self.logs = saved_state.get('logs', []) + self.logs
             
@@ -1949,6 +2201,8 @@ class LiveManager:
         
         # 15:15 Square-off
         if t_time >= datetime.time(15, 15):
+            if self.mode == "LIVE_REAL" and self.kite and state.get('entry_order_id'):
+                self._cancel_resting_entry(opt_type, strike, state, current_time)
             if state['position'] is not None:
                 pnl = 0.0
                 lots_closed = 2 if state['position'] == 'SHORT_2_LOTS' else 1
@@ -1994,9 +2248,9 @@ class LiveManager:
             
         # Position Logic
         if state['position'] is None:
-            if getattr(self, 'feed_disrupted', False) or getattr(self, 'circuit_breaker_tripped', False):
-                return
-            if state.get('trend_frozen', False):
+            if getattr(self, 'feed_disrupted', False) or getattr(self, 'circuit_breaker_tripped', False) or state.get('trend_frozen', False):
+                if self.mode == "LIVE_REAL" and self.kite and state.get('entry_order_id'):
+                    self._cancel_resting_entry(opt_type, strike, state, current_time)
                 return
 
             # Dynamic Runaway Premium Shield & Reversion Unlock (asymmetric leg freeze)
@@ -2015,6 +2269,8 @@ class LiveManager:
                     state['runaway_blocked'] = False
                     self.add_log(f"🟢 [RUNAWAY UNLOCKED] {opt_type} {strike} reverted <= open (₹{o_price:.2f} <= ₹{open_px:.2f}). Resuming entry watch.")
             if state.get('runaway_blocked', False):
+                if self.mode == "LIVE_REAL" and self.kite and state.get('entry_order_id'):
+                    self._cancel_resting_entry(opt_type, strike, state, current_time)
                 return
                 
             # Recommendation 2: Cooldown Circuit Breaker Check
@@ -2035,7 +2291,8 @@ class LiveManager:
                         cooldown_until_dt = cooldown_until_dt.replace(tzinfo=None)
 
                     if current_time < cooldown_until_dt:
-                        # Cooldown in effect, skip new entry
+                        if self.mode == "LIVE_REAL" and self.kite and state.get('entry_order_id'):
+                            self._cancel_resting_entry(opt_type, strike, state, current_time)
                         return
                     else:
                         # Cooldown period completed
@@ -2058,10 +2315,48 @@ class LiveManager:
                 state['above_entry_threshold'] = True
                 
             if state['entry_count'] < self.max_reentries:
+                desired_limit = round_to_tick(target_entry)
+                is_resting_real = (self.mode == "LIVE_REAL" and self.kite is not None and getattr(self, 'resting_limit_entries', True))
+
+                if is_resting_real and state.get('above_entry_threshold', False) and desired_limit > 0 and o_price > 0:
+                    existing_id = state.get('entry_order_id')
+                    if existing_id:
+                        snap = self._get_order_snapshot(existing_id)
+                        if snap and snap["status"] == "COMPLETE" and snap["filled_quantity"] > 0:
+                            fill_px = snap["average_price"] if snap["average_price"] > 0 else desired_limit
+                            lots = 1 if snap["filled_quantity"] == self.lot_size else 2
+                            self._activate_filled_entry(opt_type, strike, state, fill_px, lots, current_time)
+                            return
+                        elif snap and snap["status"] in ("CANCELLED", "REJECTED"):
+                            state['entry_order_id'] = None
+                            state['entry_order_price'] = 0.0
+                        elif abs(desired_limit - state.get('entry_order_price', 0.0)) >= 0.05:
+                            if self._modify_limit_order_price(existing_id, desired_limit):
+                                state['entry_order_price'] = desired_limit
+                            else:
+                                post_snap = self._get_order_snapshot(existing_id)
+                                if post_snap and post_snap["status"] == "COMPLETE" and post_snap["filled_quantity"] > 0:
+                                    fill_px = post_snap["average_price"] if post_snap["average_price"] > 0 else desired_limit
+                                    lots = 1 if post_snap["filled_quantity"] == self.lot_size else 2
+                                    self._activate_filled_entry(opt_type, strike, state, fill_px, lots, current_time)
+                                    return
+                        return
+                    elif o_price > target_entry:
+                        margin_req, _ = self.calculate_margins(current_time, extra_leg=opt_type, extra_lots=2)
+                        margins_info = self.get_live_broker_margins()
+                        avail_cash = margins_info.get("available", 0.0) if margins_info else self.capital
+                        if avail_cash >= margin_req * 1.15:
+                            symbol = self.get_option_symbol(strike, opt_type, current_time)
+                            res = self.place_zerodha_order(symbol, "SELL", 2 * self.lot_size, order_type="LIMIT", price=desired_limit, wait_polls=0)
+                            if res and res.get("order_id"):
+                                state['entry_order_id'] = res["order_id"]
+                                state['entry_order_price'] = desired_limit
+                                self.add_log(f"📌 [RESTING LIMIT ARMED] {opt_type} {strike} LIMIT SELL 2 Lots @ ₹{desired_limit:.2f} (Order {res['order_id']})")
+                        return
+
                 if o_price <= target_entry and o_price > 0 and state.get('above_entry_threshold', False):
                     # Recommendation 1: Limit Order Fill Capping
                     entry_fill_price = round(target_entry, 2)
-                    entry_pos = 'SHORT_2_LOTS'
                     entry_lots = 2
 
                     if self.mode == "LIVE_REAL" and self.kite:
@@ -2084,7 +2379,6 @@ class LiveManager:
                             entry_fill_price = round(filled_px, 2)
                         if outcome == "PARTIAL":
                             if filled_qty == self.lot_size:
-                                entry_pos = 'SHORT_1_LOT'
                                 entry_lots = 1
                                 self.add_log(f"⚠️ [PARTIAL ENTRY] {opt_type} {strike} filled 1 lot ({filled_qty} qty) @ ₹{entry_fill_price:.2f}. Tracking SHORT_1_LOT.")
                             else:
@@ -2092,26 +2386,7 @@ class LiveManager:
                                 self.place_zerodha_order(symbol, "BUY", filled_qty, order_type="MARKET")
                                 return
                             
-                    state['position'] = entry_pos
-                    state['entry_price'] = entry_fill_price
-                    state['entry_count'] += 1
-                    state['current_sl'] = state['day_high']
-                    state['target'] = state['day_high'] * (1.0 - self.lot_1_target_pct)
-                    state['min_price'] = entry_fill_price
-                    state['entry_time'] = current_time.strftime('%H:%M:%S')
-                    state['above_entry_threshold'] = None
-                    state['sl_order_id'] = None
-
-                    # Place immediate exchange-side Stop-Loss Limit (SL-L) order in LIVE_REAL mode
-                    if self.mode == "LIVE_REAL" and self.kite:
-                        symbol = self.get_option_symbol(strike, opt_type, current_time)
-                        sl_res = self.place_zerodha_sl_order(symbol, entry_lots * self.lot_size, trigger_price=state['current_sl'])
-                        if sl_res and sl_res.get("order_id"):
-                            state['sl_order_id'] = sl_res.get("order_id")
-                            self.add_log(f"🛡️ [HARD SL ARMED] {opt_type} {strike} SL-L Order {state['sl_order_id']} active on Zerodha exchange @ ₹{state['current_sl']:.2f}")
-
-                    self.add_log(f"[ENTRY #{state['entry_count']}] Shorted {entry_lots} Lots of {opt_type} {strike} at {entry_fill_price:.2f} (SL: {state['current_sl']:.2f} | Target: {state['target']:.2f})")
-                    send_telegram_alert(f"🚀 <b>ENTRY #{state['entry_count']} TRIGGERED</b>\n{opt_type} {strike} Short {entry_lots} Lots @ ₹{entry_fill_price:.2f}\nSL: ₹{state['current_sl']:.2f} | Target: ₹{state['target']:.2f}")
+                    self._activate_filled_entry(opt_type, strike, state, entry_fill_price, entry_lots, current_time)
                     
         elif state['position'] == 'SHORT_2_LOTS':
             state['min_price'] = min(state['min_price'], o_price)
@@ -2125,8 +2400,8 @@ class LiveManager:
 
             if new_sl != old_sl:
                 state['current_sl'] = new_sl
-                if self.mode == "LIVE_REAL" and self.kite and state.get('sl_order_id'):
-                    self.modify_zerodha_sl_order(state['sl_order_id'], trigger_price=new_sl, quantity=2 * self.lot_size)
+                if not self._sync_exchange_sl_order(opt_type, strike, 2 * self.lot_size, new_sl, current_time, state):
+                    return
                 
             # Check SL
             if o_price >= state['current_sl']:
@@ -2137,71 +2412,8 @@ class LiveManager:
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
                     exit_fill_price = self._close_position_real(symbol, 2 * self.lot_size, state, exit_fill_price, cancel_first=False)
-                        
-                pnl = (round(state['entry_price'], 2) - round(exit_fill_price, 2)) * 2 * self.lot_size
-                self.realized_pnl += pnl
-                
-                reason = "Stop Loss (Shifted)" if state['current_sl'] < state['day_high'] else "Stop Loss (Initial)"
-                
-                trade_rec = {
-                    "date": current_time.strftime('%Y-%m-%d'),
-                    "type": opt_type,
-                    "strike": strike,
-                    "lots": 2,
-                    "entry_time": state['entry_time'] or "09:30:00",
-                    "entry_price": round(state['entry_price'], 2),
-                    "exit_time": current_time.strftime('%H:%M:%S'),
-                    "exit_price": round(exit_fill_price, 2),
-                    "sl": round(state['current_sl'], 2),
-                    "day_high": round(state['day_high'], 2),
-                    "pnl": round(pnl, 2),
-                    "reason": reason
-                }
-                save_live_trade(trade_rec)
-                
-                state['position'] = None
-                state['unrealized'] = 0.0
-                state['above_entry_threshold'] = None
-                state['sl_order_id'] = None
-                
-                self.add_log(f"[{reason.upper()}] {opt_type} SL hit at {exit_fill_price:.2f} (PnL: ₹{pnl:.2f})")
-                send_telegram_alert(f"🛑 <b>{reason.upper()} HIT</b>\n{opt_type} {strike} Closed @ ₹{exit_fill_price:.2f}\nPnL: ₹{pnl:.2f}")
 
-                # Asymmetric 2-Consecutive-SL Trend Freeze
-                state['consec_sl'] = state.get('consec_sl', 0) + 1
-                if getattr(self, 'enable_2sl_trend_freeze', True) and state['consec_sl'] >= 2:
-                    state['trend_frozen'] = True
-                    self.add_log(f"🧊 [2-SL TREND FREEZE] {opt_type} hit {state['consec_sl']} consecutive SLs without a Lot-1 Target win. Freezing {opt_type} entries for today.")
-                    send_telegram_alert(f"🧊 <b>2-SL TREND FREEZE</b>\n{opt_type} hit 2 consecutive Stop Losses. Freezing {opt_type} for remainder of day.")
-
-                # Recommendation 2: Consecutive Loss Circuit Breaker Tracking
-                now_ts = current_time
-                sl_list = state.get('recent_sl_times', [])
-                clean_sl_list = []
-                for t in sl_list:
-                    if isinstance(t, str):
-                        try:
-                            t_dt = datetime.datetime.fromisoformat(t)
-                        except Exception:
-                            continue
-                    else:
-                        t_dt = t
-                    if hasattr(now_ts, 'tzinfo') and now_ts.tzinfo is not None and t_dt.tzinfo is None:
-                        t_dt = now_ts.tzinfo.localize(t_dt)
-                    elif hasattr(now_ts, 'tzinfo') and now_ts.tzinfo is None and t_dt.tzinfo is not None:
-                        t_dt = t_dt.replace(tzinfo=None)
-                    if hasattr(now_ts, '__sub__') and (now_ts - t_dt).total_seconds() <= 90 * 60:
-                        clean_sl_list.append(t_dt)
-                clean_sl_list.append(now_ts)
-
-                if len(clean_sl_list) >= 3:
-                    state['cooldown_until'] = now_ts + datetime.timedelta(minutes=45)
-                    state['recent_sl_times'] = []
-                    cooldown_str = state['cooldown_until'].strftime('%H:%M:%S')
-                    self.add_log(f"⚠️ [CIRCUIT BREAKER] {opt_type} triggered 3 consecutive Stop Losses within 90 minutes. Entering 45-minute cooldown until {cooldown_str}.")
-                    send_telegram_alert(f"⚠️ <b>CONSECUTIVE LOSS CIRCUIT BREAKER</b>\n{opt_type} triggered 3 consecutive Stop Losses within 90 minutes.\nPausing {opt_type} entries for 45 minutes until {cooldown_str}.")
-                else:
-                    state['recent_sl_times'] = clean_sl_list
+                self._finalize_sl_exit(opt_type, strike, state, exit_fill_price, current_time)
                 
             # Check Target Lot 1
             elif o_price <= state['target']:
@@ -2242,9 +2454,8 @@ class LiveManager:
                 state['unrealized'] = (state['entry_price'] - o_price) * self.lot_size
                 state['current_sl'] = get_trailed_sl(state['min_price'], state['day_high'])
 
-                # Modify existing exchange SL-L order to protect remaining 1 Lot
-                if self.mode == "LIVE_REAL" and self.kite and state.get('sl_order_id'):
-                    self.modify_zerodha_sl_order(state['sl_order_id'], trigger_price=state['current_sl'], quantity=1 * self.lot_size)
+                # Modify (or cancel+replace) existing exchange SL-L order to protect remaining 1 Lot
+                self._sync_exchange_sl_order(opt_type, strike, 1 * self.lot_size, state['current_sl'], current_time, state)
 
                 self.add_log(f"[TARGET LOT 1] {opt_type} Target reached at {exit_fill_price:.2f} (Realized: +₹{pnl:.2f})")
                 send_telegram_alert(f"🎯 <b>TARGET LOT 1 REACHED</b>\n{opt_type} {strike} Exited 1 Lot @ ₹{exit_fill_price:.2f}\nRealized PnL: +₹{pnl:.2f}")
@@ -2254,8 +2465,8 @@ class LiveManager:
             new_sl = get_trailed_sl(state['min_price'], state['day_high'])
             if new_sl < state['current_sl']:
                 state['current_sl'] = new_sl
-                if self.mode == "LIVE_REAL" and self.kite and state.get('sl_order_id'):
-                    self.modify_zerodha_sl_order(state['sl_order_id'], trigger_price=new_sl, quantity=1 * self.lot_size)
+                if not self._sync_exchange_sl_order(opt_type, strike, 1 * self.lot_size, new_sl, current_time, state):
+                    return
 
             state['unrealized'] = (state['entry_price'] - o_price) * self.lot_size
             
@@ -2268,32 +2479,8 @@ class LiveManager:
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
                     exit_fill_price = self._close_position_real(symbol, 1 * self.lot_size, state, exit_fill_price, cancel_first=False)
-                        
-                pnl = (round(state['entry_price'], 2) - round(exit_fill_price, 2)) * self.lot_size
-                self.realized_pnl += pnl
-                
-                trade_rec = {
-                    "date": current_time.strftime('%Y-%m-%d'),
-                    "type": opt_type,
-                    "strike": strike,
-                    "lots": 1,
-                    "entry_time": state['entry_time'] or "09:30:00",
-                    "entry_price": round(state['entry_price'], 2),
-                    "exit_time": current_time.strftime('%H:%M:%S'),
-                    "exit_price": round(exit_fill_price, 2),
-                    "sl": round(state['current_sl'], 2),
-                    "day_high": round(state['day_high'], 2),
-                    "pnl": round(pnl, 2),
-                    "reason": "Trailing Stop Loss"
-                }
-                save_live_trade(trade_rec)
-                
-                state['position'] = None
-                state['unrealized'] = 0.0
-                state['above_entry_threshold'] = None
-                state['sl_order_id'] = None
-                self.add_log(f"[TRAILING SL] {opt_type} Trailing SL hit at {exit_fill_price:.2f} (PnL: ₹{pnl:.2f})")
-                send_telegram_alert(f"🛑 <b>TRAILING SL HIT</b>\n{opt_type} {strike} Exited Lot 2 @ ₹{exit_fill_price:.2f}\nPnL: ₹{pnl:.2f}")
+
+                self._finalize_sl_exit(opt_type, strike, state, exit_fill_price, current_time)
 
     def _reconcile_peak_x_from_exchange(self, current_time):
         """Every 60s while flat, reconcile Day High X against Zerodha intraday OHLC.high to self-heal phantom ticks."""
@@ -2728,9 +2915,10 @@ class LiveManager:
                 
                 # B. Strategy Rules check
                 if self.strategy_state['PE']['strike'] is not None:
-                    # Periodic 60s exchange OHLC peak X reconciliation while flat (heals phantom spikes / missed highs)
+                    # Periodic 60s exchange OHLC peak X reconciliation while flat & 20s SL order sync while in trade
                     if t_time >= datetime.time(9, 30) and t_time < datetime.time(15, 15):
                         self._reconcile_peak_x_from_exchange(current_time)
+                        self._sync_active_sl_orders(current_time)
 
                     # Watchdog Check for WebSocket Heartbeat (Live mode only)
                     if self.mode in ["LIVE", "LIVE_REAL"] and self.websocket_active and self.last_websocket_tick_time:
@@ -2779,14 +2967,15 @@ class LiveManager:
                 # C. Compute total unrealized and packet updates
                 total_unrealized = sum(self.strategy_state[k]['unrealized'] for k in modes)
                 
-                # 20% Daily Drawdown Circuit Breaker Check
-                max_daily_loss = self.capital * 0.20
+                # Daily Drawdown Circuit Breaker Check (configurable %, default 6%)
+                limit_pct = getattr(self, 'daily_loss_limit_pct', 0.06)
+                max_daily_loss = self.capital * limit_pct
                 current_daily_pnl = self.realized_pnl + total_unrealized
                 if current_daily_pnl <= -max_daily_loss and not getattr(self, 'circuit_breaker_tripped', False):
                     self.circuit_breaker_tripped = True
-                    self.add_log(f"🚨 20% DAILY DRAWDOWN CIRCUIT BREAKER TRIPPED! Current PnL: ₹{current_daily_pnl:.2f} (Limit: -₹{max_daily_loss:.2f})")
-                    send_telegram_alert(f"🚨 <b>20% CIRCUIT BREAKER TRIPPED</b>\nCurrent PnL: ₹{current_daily_pnl:.2f}\nExecuting Emergency Market Square-Off...")
-                    self.panic_square_off("20% Daily Drawdown Limit")
+                    self.add_log(f"🚨 {limit_pct*100:.1f}% DAILY DRAWDOWN CIRCUIT BREAKER TRIPPED! Current PnL: ₹{current_daily_pnl:.2f} (Limit: -₹{max_daily_loss:.2f})")
+                    send_telegram_alert(f"🚨 <b>{limit_pct*100:.1f}% CIRCUIT BREAKER TRIPPED</b>\nCurrent PnL: ₹{current_daily_pnl:.2f}\nExecuting Emergency Market Square-Off...")
+                    self.panic_square_off(f"{limit_pct*100:.1f}% Daily Drawdown Limit")
 
                 pe_packet = self.strategy_state['PE']
                 ce_packet = self.strategy_state['CE']

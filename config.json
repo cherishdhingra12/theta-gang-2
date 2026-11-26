@@ -13,6 +13,8 @@
   "r": 7.0,
   "runaway_block_pct": 50.0,
   "runaway_unlock_on_reversion": true,
-  "enable_2sl_trend_freeze": true,
-  "realistic_paper_sl_fill": true
+  "enable_2sl_trend_freeze": false,
+  "realistic_paper_sl_fill": true,
+  "daily_loss_limit_pct": 6.0,
+  "resting_limit_entries": true
 }

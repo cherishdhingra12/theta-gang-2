@@ -325,12 +325,22 @@ def api_live_control():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+SECRET_MASK = "********"
+SECRET_CONFIG_KEYS = ('kite_api_secret', 'kite_password', 'kite_totp_secret')
+
+def _mask_config_secrets(cfg):
+    masked = dict(cfg)
+    for k in SECRET_CONFIG_KEYS:
+        if masked.get(k):
+            masked[k] = SECRET_MASK
+    return masked
+
 @app.route('/api/live/config', methods=['GET', 'POST'])
 def api_live_config():
     try:
         from live_feed import load_strategy_config, save_strategy_config
         if request.method == 'GET':
-            return jsonify(load_strategy_config())
+            return jsonify(_mask_config_secrets(load_strategy_config()))
         else:
             data = request.get_json() or {}
             config = load_strategy_config()
@@ -346,19 +356,19 @@ def api_live_config():
             for int_key in ['strike_offset_pe', 'strike_offset_ce', 'max_reentries', 'lot_size']:
                 if int_key in data:
                     config[int_key] = int(data[int_key])
-            for float_key in ['capital', 'entry_discount', 'lot_1_target', 'iv', 'r']:
+            for float_key in ['capital', 'entry_discount', 'lot_1_target', 'iv', 'r', 'daily_loss_limit_pct', 'runaway_block_pct']:
                 if float_key in data:
                     config[float_key] = float(data[float_key])
+            for bool_key in ['enable_2sl_trend_freeze', 'resting_limit_entries', 'runaway_unlock_on_reversion']:
+                if bool_key in data:
+                    config[bool_key] = bool(data[bool_key])
             if 'kite_api_key' in data:
                 config['kite_api_key'] = str(data['kite_api_key'])
-            if 'kite_api_secret' in data:
-                config['kite_api_secret'] = str(data['kite_api_secret'])
             if 'kite_user_id' in data:
                 config['kite_user_id'] = str(data['kite_user_id'])
-            if 'kite_password' in data:
-                config['kite_password'] = str(data['kite_password'])
-            if 'kite_totp_secret' in data:
-                config['kite_totp_secret'] = str(data['kite_totp_secret'])
+            for secret_key in SECRET_CONFIG_KEYS:
+                if secret_key in data and str(data[secret_key]) != SECRET_MASK:
+                    config[secret_key] = str(data[secret_key])
                 
             save_strategy_config(config)
             
@@ -373,9 +383,9 @@ def api_live_config():
             
             live_manager.kite_configured = bool(api_key and api_secret and user_id and password)
             
-            # If credentials changed, reset the active client so it re-authenticates on next tick
+            # If credentials changed (non-masked), reset the active client so it re-authenticates on next tick
             cred_keys = ['kite_api_key', 'kite_api_secret', 'kite_user_id', 'kite_password', 'kite_totp_secret']
-            if any(k in data for k in cred_keys):
+            if any(k in data and str(data[k]) != SECRET_MASK for k in cred_keys):
                 live_manager.kite = None
                 
             if live_manager.status == "RUNNING" or live_manager.status == "FEED_DISRUPTED":
@@ -385,8 +395,14 @@ def api_live_config():
                     live_manager.r = float(data['r']) / 100.0
                 if 'capital' in data:
                     live_manager.capital = float(data['capital'])
+                if 'daily_loss_limit_pct' in data:
+                    live_manager.daily_loss_limit_pct = float(data['daily_loss_limit_pct']) / 100.0
+                if 'enable_2sl_trend_freeze' in data:
+                    live_manager.enable_2sl_trend_freeze = bool(data['enable_2sl_trend_freeze'])
+                if 'resting_limit_entries' in data:
+                    live_manager.resting_limit_entries = bool(data['resting_limit_entries'])
             
-            return jsonify({'status': 'success', 'config': config})
+            return jsonify({'status': 'success', 'config': _mask_config_secrets(config)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

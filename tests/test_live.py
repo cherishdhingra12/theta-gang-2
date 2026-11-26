@@ -21,9 +21,11 @@ class TestLiveFeedEngine(unittest.TestCase):
         self.orig_trades_path = live_feed.TRADES_PATH
         self.orig_state_path = live_feed.LIVE_STATE_PATH
         self.orig_symbol_path = live_feed.SYMBOL_KNOWLEDGE_PATH
+        self.orig_config_path = live_feed.CONFIG_PATH
         live_feed.TRADES_PATH = os.path.join(self.test_dir.name, "live_trades.json")
         live_feed.LIVE_STATE_PATH = os.path.join(self.test_dir.name, "live_state.json")
         live_feed.SYMBOL_KNOWLEDGE_PATH = os.path.join(self.test_dir.name, "symbol_knowledge.json")
+        live_feed.CONFIG_PATH = os.path.join(self.test_dir.name, "config.json")
 
         # Sample mockup response from the NSE Option Chain API
         self.mock_option_chain_data = {
@@ -80,6 +82,7 @@ class TestLiveFeedEngine(unittest.TestCase):
         live_feed.TRADES_PATH = self.orig_trades_path
         live_feed.LIVE_STATE_PATH = self.orig_state_path
         live_feed.SYMBOL_KNOWLEDGE_PATH = self.orig_symbol_path
+        live_feed.CONFIG_PATH = self.orig_config_path
         self.test_dir.cleanup()
 
     def test_live_manager_mock_lifecycle(self):
@@ -1010,6 +1013,190 @@ class TestLiveFeedEngine(unittest.TestCase):
         self.assertEqual(manager.strategy_state['PE']['day_high'], 124.50)
         # In-position CE leg is frozen and untouched
         self.assertEqual(manager.strategy_state['CE']['day_high'], 140.0)
+
+    def test_resting_limit_entry_arms_modifies_and_activates_sl(self):
+        """Workstream 1: Resting LIMIT SELL arms above market, tracks day_high, and arms SL on fill."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.capital = 650000.0
+        manager.entry_discount = 0.10
+        manager.lot_1_target_pct = 0.40
+        manager.max_reentries = 5
+        manager.lot_size = 65
+        manager.resting_limit_entries = True
+
+        mock_kite = MagicMock()
+        mock_kite.VARIETY_REGULAR = "regular"
+        mock_kite.EXCHANGE_NFO = "NFO"
+        mock_kite.PRODUCT_NRML = "NRML"
+        mock_kite.margins.return_value = {"available": {"live_balance": 650000.0}, "utilised": {"debits": 0.0}}
+        mock_kite.basket_order_margins.return_value = {"initial": {"total": 350000.0}}
+        mock_kite.place_order.side_effect = ["ORD_REST_1", "ORD_SL_1"]
+        mock_kite.order_history.side_effect = (
+            [[{"status": "OPEN", "filled_quantity": 0, "average_price": 0.0}],       # modify check tick
+             [{"status": "COMPLETE", "filled_quantity": 130, "average_price": 279.0}]]  # filled tick
+            + [[{"status": "OPEN", "filled_quantity": 0, "average_price": 0.0}] for _ in range(6)]  # SL poll
+        )
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25850PE")
+        manager.strategy_state = {
+            'PE': {
+                'strike': 25850, 'day_high': 300.0, 'entry_count': 0, 'position': None,
+                'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'),
+                'unrealized': 0.0, 'price': 285.0, 'entry_time': None,
+                'above_entry_threshold': True, 'entry_order_id': None, 'entry_order_price': 0.0,
+                'recent_sl_times': [], 'cooldown_until': None
+            },
+            'CE': {'strike': 25650, 'position': None}
+        }
+
+        t1 = datetime.datetime(2026, 11, 26, 9, 40, 0)
+        with patch('time.sleep'):
+            # Price 285 > target_entry 270 -> arms resting LIMIT SELL @ 270.00 immediately
+            manager._evaluate_strategy_for_leg('PE', 285.0, 285.0, 285.0, t1)
+            self.assertEqual(manager.strategy_state['PE']['entry_order_id'], "ORD_REST_1")
+            self.assertEqual(manager.strategy_state['PE']['entry_order_price'], 270.0)
+            self.assertIsNone(manager.strategy_state['PE']['position'])
+
+            # Day high rises to 310 -> resting limit updates to 279.00
+            manager.strategy_state['PE']['day_high'] = 310.0
+            manager._evaluate_strategy_for_leg('PE', 290.0, 290.0, 290.0, t1 + datetime.timedelta(minutes=2))
+            mock_kite.modify_order.assert_called_once()
+            self.assertEqual(manager.strategy_state['PE']['entry_order_price'], 279.0)
+
+            # Next tick sees COMPLETE fill -> transitions to SHORT_2_LOTS and arms 130-qty SL-L
+            manager._evaluate_strategy_for_leg('PE', 278.0, 278.0, 278.0, t1 + datetime.timedelta(minutes=4))
+            self.assertEqual(manager.strategy_state['PE']['position'], 'SHORT_2_LOTS')
+            self.assertEqual(manager.strategy_state['PE']['entry_price'], 279.0)
+            self.assertEqual(manager.strategy_state['PE']['sl_order_id'], "ORD_SL_1")
+            self.assertIsNone(manager.strategy_state['PE']['entry_order_id'])
+
+    def test_modify_sl_failure_triggers_cancel_and_replace_on_target_1(self):
+        """Workstream 1: Failed SL modify on Target Lot 1 cancels old 2-lot SL and places fresh 1-lot SL."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.lot_size = 65
+        manager.lot_1_target_pct = 0.40
+
+        mock_kite = MagicMock()
+        mock_kite.VARIETY_REGULAR = "regular"
+        mock_kite.EXCHANGE_NFO = "NFO"
+        mock_kite.PRODUCT_NRML = "NRML"
+        mock_kite.modify_order.side_effect = Exception("Modify rejected")
+        mock_kite.order_history.return_value = [{"status": "TRIGGER PENDING", "filled_quantity": 0, "average_price": 0.0}]
+        mock_kite.place_order.return_value = "ORD_SL_FRESH_1LOT"
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25850PE")
+
+        state = {
+            'strike': 25850, 'position': 'SHORT_1_LOT', 'entry_price': 270.0, 'day_high': 300.0,
+            'current_sl': 270.0, 'sl_order_id': 'ORD_SL_OLD_2LOT', 'recent_sl_times': [], 'consec_sl': 0
+        }
+        with patch('time.sleep'):
+            ok = manager._sync_exchange_sl_order('PE', 25850, 65, 270.0, datetime.datetime(2026, 11, 26, 12, 0, 0), state)
+
+        self.assertTrue(ok)
+        mock_kite.cancel_order.assert_called_once()
+        self.assertEqual(state['sl_order_id'], "ORD_SL_FRESH_1LOT")
+        placed_kwargs = mock_kite.place_order.call_args.kwargs
+        self.assertEqual(placed_kwargs['quantity'], 65)
+        self.assertEqual(placed_kwargs['order_type'], "SL")
+
+    def test_bg_sl_sync_and_restart_reconcile_close_filled_sl(self):
+        """Workstream 1: Both 20s BG SL sync and restart reconciliation close positions if exchange SL filled."""
+        manager = LiveManager()
+        manager.mode = "LIVE_REAL"
+        manager.lot_size = 65
+        manager.last_sl_sync_time = 0.0
+        mock_kite = MagicMock()
+        mock_kite.order_history.return_value = [{"status": "COMPLETE", "filled_quantity": 130, "average_price": 300.0}]
+        manager.kite = mock_kite
+        manager.strategy_state = {
+            'PE': {
+                'strike': 25850, 'position': 'SHORT_2_LOTS', 'entry_price': 270.0, 'day_high': 300.0,
+                'current_sl': 300.0, 'sl_order_id': 'ORD_SL_DONE', 'entry_time': '09:40:00',
+                'recent_sl_times': [], 'consec_sl': 0
+            },
+            'CE': {'strike': 25650, 'position': None}
+        }
+
+        with patch('time.sleep'):
+            manager._reconcile_broker_state_on_sync(datetime.datetime(2026, 11, 26, 11, 0, 0))
+        self.assertIsNone(manager.strategy_state['PE']['position'])
+        self.assertIsNone(manager.strategy_state['PE']['sl_order_id'])
+        self.assertAlmostEqual(manager.realized_pnl, (270.0 - 300.0) * 130, places=2)
+
+    def test_shifted_breakeven_sl_does_not_increment_loss_counters(self):
+        """Workstream 2: Breakeven Stop Loss (Shifted) must not increment consec_sl or 2-SL freeze defaults False."""
+        manager = LiveManager()
+        self.assertFalse(manager.enable_2sl_trend_freeze)
+        self.assertEqual(manager.daily_loss_limit_pct, 0.06)
+
+        manager.mode = "LIVE"
+        manager.lot_size = 65
+        state = {
+            'strike': 25700, 'position': 'SHORT_2_LOTS', 'entry_price': 281.61, 'day_high': 312.90,
+            'current_sl': 281.61, 'entry_time': '09:30:23', 'consec_sl': 0, 'recent_sl_times': []
+        }
+        pnl = manager._finalize_sl_exit('CE', 25700, state, 281.61, datetime.datetime(2026, 11, 26, 9, 55, 21))
+        self.assertEqual(pnl, 0.0)
+        self.assertEqual(state['consec_sl'], 0)
+        self.assertEqual(state['recent_sl_times'], [])
+
+    def test_api_config_masks_and_preserves_secrets(self):
+        """Workstream 2: /api/live/config redacts secrets on GET and preserves existing secrets on masked POST."""
+        import base64
+        import app as flask_app
+        flask_app.app.testing = True
+        client = flask_app.app.test_client()
+        auth_hdr = {'Authorization': 'Basic ' + base64.b64encode(b'testu:testp').decode()}
+
+        fake_cfg = {
+            'auto_pilot': True, 'mode': 'LIVE', 'capital': 500000.0,
+            'kite_api_key': 'KEY123', 'kite_api_secret': 'SUPER_SECRET',
+            'kite_user_id': 'USR1', 'kite_password': 'MY_PASSWORD', 'kite_totp_secret': 'TOTP_BASE32'
+        }
+        with patch.dict(os.environ, {'BASIC_AUTH_USER': 'testu', 'BASIC_AUTH_PASS': 'testp'}), \
+             patch('live_feed.load_strategy_config', return_value=fake_cfg), \
+             patch('live_feed.save_strategy_config') as mock_save:
+            res = client.get('/api/live/config', headers=auth_hdr)
+            self.assertEqual(res.status_code, 200)
+            body = res.get_json()
+            self.assertEqual(body['kite_api_secret'], '********')
+            self.assertEqual(body['kite_password'], '********')
+            self.assertEqual(body['kite_totp_secret'], '********')
+            self.assertEqual(body['kite_api_key'], 'KEY123')
+
+            post_res = client.post('/api/live/config', json={'capital': 650000.0, 'kite_password': '********'}, headers=auth_hdr)
+            self.assertEqual(post_res.status_code, 200)
+            saved_arg = mock_save.call_args[0][0]
+            self.assertEqual(saved_arg['kite_password'], 'MY_PASSWORD')
+            self.assertEqual(post_res.get_json()['config']['kite_password'], '********')
+
+    def test_lightweight_http_kite_login(self):
+        """Workstream 2: Direct HTTP login resolves request_token and access_token without Playwright."""
+        import kite_auth
+        mock_session = MagicMock()
+        get_login = MagicMock(status_code=200, url="https://kite.zerodha.com/connect/login?v=3&sess_id=SESS99")
+        post_login = MagicMock()
+        post_login.json.return_value = {"status": "success", "data": {"request_id": "REQ123"}}
+        post_twofa = MagicMock()
+        post_twofa.json.return_value = {"status": "success"}
+        hop_redirect = MagicMock(headers={"Location": "http://127.0.0.1:5001/?request_token=TOK_XYZ&status=success"}, url="")
+        mock_session.get.side_effect = [get_login, hop_redirect]
+        mock_session.post.side_effect = [post_login, post_twofa]
+
+        mock_kite = MagicMock()
+        mock_kite.login_url.return_value = "https://kite.zerodha.com/connect/login?v=3&api_key=K"
+        mock_kite.generate_session.return_value = {"access_token": "ACC_HTTP_OK"}
+
+        with patch('kite_auth.requests.Session', return_value=mock_session), \
+             patch('kite_auth.KiteConnect', return_value=mock_kite), \
+             patch('kite_auth._automate_kite_login_playwright') as mock_pw:
+            tok = kite_auth.automate_kite_login("K", "S", "U", "P", "JBSWY3DPEHPK3PXP")
+
+        self.assertEqual(tok, "ACC_HTTP_OK")
+        mock_pw.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()

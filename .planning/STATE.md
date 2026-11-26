@@ -1,7 +1,6 @@
 # Project State
 
-- **Current Milestone**: Phase 1 + Risk Shields Deployed to Oracle VPS (`140.238.241.115`); 15-Session `LIVE` (`BOTH`) Surveillance Active
-- **Verified Commit**: `8f8a65c` (35/35 unit tests passing on VPS, 311 live trades intact)
-- **Nov 26 Session Summary**: +₹16,638.70 gross (PE +₹10,696.40 | CE +₹5,942.30) — both legs flat at close
-- **Next Gate**: Review `PE` vs `CE` net expectancy after ~15 live sessions before enabling `LIVE_REAL`
+- **Current Milestone**: Workstream 1 (`LIVE_REAL` Full Execution Parity) & Workstream 2 (Guardrails, Secret Redaction, HTTP Kite Auth) Implemented & Tested (41/41 tests)
+- **Active Surveillance Config**: `mode="LIVE"`, `strategy_type="BOTH"`, `enable_2sl_trend_freeze=false`, `daily_loss_limit_pct=6.0`, `resting_limit_entries=true`
+- **Next Gate**: 15-session `LIVE` surveillance on `BOTH` before funding `LIVE_REAL` + closing public HTTP port `8001` (SSH tunnel / Caddy TLS)
 - **Date**: 2026-11-26
