@@ -2,6 +2,8 @@
 
 **Goal**: Safely transition `Theta_Gang_2` from `LIVE` (live-feed paper trading) to `LIVE_REAL` (real capital on Zerodha Kite Connect) with verified execution safety, resolved CE-leg drag, and secure operations.
 
+> See [MASTER_PLAN.md](./MASTER_PLAN.md) for the complete 4-workstream execution blueprint backed by 311-trade empirical counterfactuals.
+
 ## Phases
 
 ### Phase 1: `LIVE_REAL` Execution Hardening *(Completed)*
