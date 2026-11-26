@@ -55,9 +55,11 @@ class TestTradingEngine(unittest.TestCase):
         
         # Deeper hit (price is 55.0, which is <= 0.6 * X but > 0.5 * X)
         self.assertEqual(get_trailed_sl(55.0, X), 80.0)
-        
-        # Massive crash (price is 9.0, which is <= 0.1 * X)
-        self.assertEqual(get_trailed_sl(9.0, X), 30.0)
+
+        # Tightened 80/90/95% decay lock slabs
+        self.assertEqual(get_trailed_sl(18.0, X), 35.0)
+        self.assertEqual(get_trailed_sl(9.0, X), 20.0)
+        self.assertEqual(get_trailed_sl(4.5, X), 10.0)
 
     def test_mock_backtest_execution(self):
         # Create a single-day mock spot dataset

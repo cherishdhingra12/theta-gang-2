@@ -10,5 +10,9 @@
   "max_reentries": 5,
   "lot_size": 65,
   "iv": 11.5,
-  "r": 7.0
+  "r": 7.0,
+  "runaway_block_pct": 50.0,
+  "runaway_unlock_on_reversion": true,
+  "enable_2sl_trend_freeze": true,
+  "realistic_paper_sl_fill": true
 }

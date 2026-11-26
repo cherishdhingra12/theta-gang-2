@@ -568,6 +568,7 @@ class TestLiveFeedEngine(unittest.TestCase):
         manager.lot_size = 65
         manager.max_reentries = 10
         manager.lot_1_target_pct = 0.30
+        manager.enable_2sl_trend_freeze = False  # Test 3-SL fallback cooldown specifically
         manager.strategy_state = {
             'CE': {
                 'strike': 24500,
@@ -927,6 +928,88 @@ class TestLiveFeedEngine(unittest.TestCase):
 
         self.assertIsNone(manager.strategy_state['PE']['position'])
         mock_kite.place_order.assert_not_called()
+
+    def test_cross_pollination_runaway_shield_reversion_and_2sl_freeze(self):
+        """Runaway +50% shield pauses entries until reversion <= open_premium; 2 consec SLs freeze leg."""
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.lot_size = 65
+        manager.entry_discount = 0.10
+        manager.lot_1_target_pct = 0.40
+        manager.max_reentries = 5
+        manager.runaway_block_pct = 0.50
+        manager.runaway_unlock_on_reversion = True
+        manager.enable_2sl_trend_freeze = True
+        manager.realistic_paper_sl_fill = True
+
+        manager.strategy_state = {
+            'PE': {
+                'strike': 25850, 'day_high': 100.0, 'open_premium': 100.0,
+                'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False,
+                'entry_count': 0, 'position': None, 'entry_price': 0.0,
+                'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'),
+                'unrealized': 0.0, 'price': 100.0, 'entry_time': None,
+                'above_entry_threshold': True, 'recent_sl_times': [], 'cooldown_until': None,
+            },
+            'CE': {'strike': 25650, 'position': None}
+        }
+
+        t1 = datetime.datetime(2026, 11, 26, 9, 40, 0)
+        # 1. Spike >= +50% vs open (100 -> 152) triggers runaway shield
+        manager.strategy_state['PE']['day_high'] = 152.0
+        manager._evaluate_strategy_for_leg('PE', 152.0, 152.0, 152.0, t1)
+        self.assertTrue(manager.strategy_state['PE']['runaway_blocked'])
+
+        # 2. While blocked, dropping to target_entry (152 * 0.9 = 136.8) does NOT enter
+        t2 = datetime.datetime(2026, 11, 26, 9, 50, 0)
+        manager._evaluate_strategy_for_leg('PE', 130.0, 130.0, 130.0, t2)
+        self.assertIsNone(manager.strategy_state['PE']['position'])
+
+        # 3. Reversion <= open_premium (100) unlocks runaway shield
+        t3 = datetime.datetime(2026, 11, 26, 10, 5, 0)
+        manager._evaluate_strategy_for_leg('PE', 99.0, 99.0, 99.0, t3)
+        self.assertFalse(manager.strategy_state['PE']['runaway_blocked'])
+        self.assertEqual(manager.strategy_state['PE']['position'], 'SHORT_2_LOTS')
+
+        # 4. Two consecutive SLs (with realistic paper fill at o_price) freeze the leg for the day
+        manager._evaluate_strategy_for_leg('PE', 155.0, 155.0, 155.0, datetime.datetime(2026, 11, 26, 10, 10, 0))
+        self.assertIsNone(manager.strategy_state['PE']['position'])
+        self.assertEqual(manager.strategy_state['PE']['consec_sl'], 1)
+        self.assertFalse(manager.strategy_state['PE']['trend_frozen'])
+
+        # Second entry and second SL
+        manager.strategy_state['PE']['above_entry_threshold'] = True
+        manager._evaluate_strategy_for_leg('PE', 100.0, 100.0, 100.0, datetime.datetime(2026, 11, 26, 10, 20, 0))
+        self.assertEqual(manager.strategy_state['PE']['position'], 'SHORT_2_LOTS')
+        manager._evaluate_strategy_for_leg('PE', 160.0, 160.0, 160.0, datetime.datetime(2026, 11, 26, 10, 25, 0))
+        self.assertEqual(manager.strategy_state['PE']['consec_sl'], 2)
+        self.assertTrue(manager.strategy_state['PE']['trend_frozen'])
+
+        # Further qualifying dips must remain ignored once trend_frozen
+        manager.strategy_state['PE']['above_entry_threshold'] = True
+        manager._evaluate_strategy_for_leg('PE', 100.0, 100.0, 100.0, datetime.datetime(2026, 11, 26, 10, 35, 0))
+        self.assertIsNone(manager.strategy_state['PE']['position'])
+
+    def test_reconcile_peak_x_from_exchange_heals_phantom_spike(self):
+        """60s exchange OHLC reconciliation heals inflated phantom Day High X when flat."""
+        manager = LiveManager()
+        manager.mode = "LIVE"
+        manager.last_peak_reconcile_time = 0.0
+        mock_kite = MagicMock()
+        mock_kite.quote.return_value = {
+            "NFO:NIFTY26NOV25850PE": {"ohlc": {"high": 124.50}},
+        }
+        manager.kite = mock_kite
+        manager.get_option_symbol = MagicMock(return_value="NFO:NIFTY26NOV25850PE")
+        manager.strategy_state = {
+            'PE': {'strike': 25850, 'position': None, 'day_high': 185.0},
+            'CE': {'strike': 25650, 'position': 'SHORT_2_LOTS', 'day_high': 140.0},
+        }
+
+        manager._reconcile_peak_x_from_exchange(datetime.datetime(2026, 11, 26, 11, 0, 0))
+        self.assertEqual(manager.strategy_state['PE']['day_high'], 124.50)
+        # In-position CE leg is frozen and untouched
+        self.assertEqual(manager.strategy_state['CE']['day_high'], 140.0)
 
 if __name__ == '__main__':
     unittest.main()

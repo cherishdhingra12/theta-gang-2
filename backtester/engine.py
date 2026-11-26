@@ -211,29 +211,31 @@ def get_trailed_sl(min_price, X):
     """
     Determines the trailed Stop Loss (SL) for Lot 2 based on the minimum option price reached.
     X: Initial Day High of the contract.
+    Includes tightened 80/90/95% decay lock slabs (0.35X, 0.20X, 0.10X).
     """
-    # Milestones are: X - 30%, X - 40%, etc. (i.e. 0.7X, 0.6X, 0.5X...)
-    # SL trails by 20% of Day High (0.2X) behind the milestone.
-    if min_price <= 0.1 * X:
-        return 0.3 * X
-    elif min_price <= 0.2 * X:
-        return 0.4 * X
-    elif min_price <= 0.3 * X:
-        return 0.5 * X
-    elif min_price <= 0.4 * X:
-        return 0.6 * X
-    elif min_price <= 0.5 * X:
-        return 0.7 * X
-    elif min_price <= 0.6 * X:
-        return 0.8 * X
-    elif min_price <= 0.7 * X:
-        return 0.9 * X
+    if min_price <= 0.05 * X:
+        return 0.10 * X
+    elif min_price <= 0.10 * X:
+        return 0.20 * X
+    elif min_price <= 0.20 * X:
+        return 0.35 * X
+    elif min_price <= 0.30 * X:
+        return 0.50 * X
+    elif min_price <= 0.40 * X:
+        return 0.60 * X
+    elif min_price <= 0.50 * X:
+        return 0.70 * X
+    elif min_price <= 0.60 * X:
+        return 0.80 * X
+    elif min_price <= 0.70 * X:
+        return 0.90 * X
     else:
         return X  # Initial SL is the day high X
 
 def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_ce=-100,
                  entry_discount=0.10, lot_1_target_pct=0.40, max_reentries=5,
-                 lot_size=75, iv=0.15, r=0.07, slippage_pts=0.0, brokerage_per_order=0.0):
+                 lot_size=75, iv=0.15, r=0.07, slippage_pts=0.0, brokerage_per_order=0.0,
+                 runaway_block_pct=0.0, runaway_unlock=False, max_consec_sl=0):
     """
     Runs the intraday options selling strategy backtest.
     df: 1-minute OHLCV spot dataframe.
@@ -306,6 +308,10 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
             
             # State Machine Variables
             day_high = 0.0
+            open_premium = 0.0
+            runaway_blocked = False
+            consec_sl = 0
+            trend_frozen = False
             entry_count = 0
             position = None  # None, 'SHORT_2_LOTS', 'SHORT_1_LOT'
             above_entry_threshold = None
@@ -329,10 +335,11 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                 
                 o_open, o_high, o_low, o_close = bar['Open'], bar['High'], bar['Low'], bar['Close']
                 
-                # 1. 09:15 to 09:30: Only identify Day High
+                # 1. 09:15 to 09:30: Only identify Day High & capture 09:30 open premium
                 if t_time <= datetime.time(9, 30):
                     if o_high > day_high:
                         day_high = o_high
+                    open_premium = o_close
                     continue
                 
                 # 2. Check if square-off time is reached (15:15 IST)
@@ -375,6 +382,9 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                 
                 # 3. Position Logic
                 if position is None:
+                    if trend_frozen:
+                        continue
+
                     # Check Cooldown Circuit Breaker
                     if cooldown_until is not None:
                         if dt < cooldown_until:
@@ -386,6 +396,15 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                     if o_high > day_high:
                         day_high = o_high
                         # Entry price updates dynamically as Day High changes
+
+                    # Runaway Premium Shield & Reversion Unlock
+                    if runaway_block_pct > 0 and open_premium > 0:
+                        if not runaway_blocked and o_high >= open_premium * (1.0 + runaway_block_pct):
+                            runaway_blocked = True
+                        elif runaway_blocked and runaway_unlock and o_low <= open_premium:
+                            runaway_blocked = False
+                    if runaway_blocked:
+                        continue
                     
                     target_entry_price = day_high * (1.0 - entry_discount)
                     
@@ -454,6 +473,9 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                         day_high = max(day_high, o_high)
                         position = None
                         above_entry_threshold = None
+                        consec_sl += 1
+                        if max_consec_sl > 0 and consec_sl >= max_consec_sl:
+                            trend_frozen = True
                         recent_sl_times = [t for t in recent_sl_times if (dt - t).total_seconds() <= 90 * 60]
                         recent_sl_times.append(dt)
                         if len(recent_sl_times) >= 3:
@@ -483,6 +505,9 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                         day_high = max(day_high, o_high)
                         position = None
                         above_entry_threshold = None
+                        consec_sl += 1
+                        if max_consec_sl > 0 and consec_sl >= max_consec_sl:
+                            trend_frozen = True
                         recent_sl_times = [t for t in recent_sl_times if (dt - t).total_seconds() <= 90 * 60]
                         recent_sl_times.append(dt)
                         if len(recent_sl_times) >= 3:
@@ -506,6 +531,7 @@ def run_backtest(df, strategy_type='BOTH', strike_offset_pe=100, strike_offset_c
                         })
                         
                         # Reset consecutive losses on profit target hit
+                        consec_sl = 0
                         recent_sl_times = []
                         
                         # Move to 1 lot state and trail SL

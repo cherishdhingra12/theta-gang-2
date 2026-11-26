@@ -119,7 +119,11 @@ def load_strategy_config():
         "max_reentries": 5,
         "lot_size": 65,
         "iv": 15.0,
-        "r": 7.0
+        "r": 7.0,
+        "runaway_block_pct": 50.0,
+        "runaway_unlock_on_reversion": True,
+        "enable_2sl_trend_freeze": True,
+        "realistic_paper_sl_fill": True,
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -298,6 +302,12 @@ class LiveManager:
         self.lot_size = 65
         self.iv = 0.15
         self.r = 0.07
+        # Cross-pollinated risk shields & realistic paper fills (independent OPTIONS SELLING learnings)
+        self.runaway_block_pct = 0.50
+        self.runaway_unlock_on_reversion = True
+        self.enable_2sl_trend_freeze = True
+        self.realistic_paper_sl_fill = True
+        self.last_peak_reconcile_time = 0.0
         
         # Current execution state
         self.spot_price = 0.0
@@ -1480,6 +1490,11 @@ class LiveManager:
             
             # Load Kite settings from saved config.json
             config = load_strategy_config()
+            self.runaway_block_pct = float(config.get('runaway_block_pct', 50.0)) / 100.0
+            self.runaway_unlock_on_reversion = bool(config.get('runaway_unlock_on_reversion', True))
+            self.enable_2sl_trend_freeze = bool(config.get('enable_2sl_trend_freeze', True))
+            self.realistic_paper_sl_fill = bool(config.get('realistic_paper_sl_fill', True))
+            self.last_peak_reconcile_time = 0.0
             # Determine if Zerodha is configured
             api_key = config.get('kite_api_key', '')
             api_secret = config.get('kite_api_secret', '')
@@ -1497,8 +1512,8 @@ class LiveManager:
             
             # Initialize Strategy State
             self.strategy_state = {
-                'PE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None},
-                'CE': {'day_high': 0.0, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None}
+                'PE': {'day_high': 0.0, 'open_premium': 0.0, 'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None},
+                'CE': {'day_high': 0.0, 'open_premium': 0.0, 'runaway_blocked': False, 'consec_sl': 0, 'trend_frozen': False, 'entry_count': 0, 'position': None, 'entry_price': 0.0, 'current_sl': 0.0, 'target': 0.0, 'min_price': float('inf'), 'unrealized': 0.0, 'strike': None, 'price': 0.0, 'entry_time': None, 'above_entry_threshold': None, 'sl_order_id': None, 'recent_sl_times': [], 'cooldown_until': None}
             }
             
             # Setup simulated clock for Mock Mode
@@ -1792,6 +1807,14 @@ class LiveManager:
                         leg['recent_sl_times'] = s_leg['recent_sl_times']
                     if s_leg.get('cooldown_until'):
                         leg['cooldown_until'] = s_leg['cooldown_until']
+                    if s_leg.get('open_premium', 0.0) > 0:
+                        leg['open_premium'] = s_leg['open_premium']
+                    if 'runaway_blocked' in s_leg:
+                        leg['runaway_blocked'] = bool(s_leg['runaway_blocked'])
+                    if 'consec_sl' in s_leg:
+                        leg['consec_sl'] = int(s_leg['consec_sl'] or 0)
+                    if 'trend_frozen' in s_leg:
+                        leg['trend_frozen'] = bool(s_leg['trend_frozen'])
                     if s_leg.get('position'):
                         leg['position'] = s_leg['position']
                         leg['entry_price'] = s_leg.get('entry_price', 0.0)
@@ -1973,6 +1996,26 @@ class LiveManager:
         if state['position'] is None:
             if getattr(self, 'feed_disrupted', False) or getattr(self, 'circuit_breaker_tripped', False):
                 return
+            if state.get('trend_frozen', False):
+                return
+
+            # Dynamic Runaway Premium Shield & Reversion Unlock (asymmetric leg freeze)
+            runaway_pct = getattr(self, 'runaway_block_pct', 0.0)
+            open_px = state.get('open_premium', 0.0)
+            if open_px <= 0 and state.get('day_high', 0.0) > 0 and o_price > 0:
+                open_px = o_price
+                state['open_premium'] = open_px
+            if runaway_pct > 0 and open_px > 0 and o_price > 0:
+                runaway_thresh = open_px * (1.0 + runaway_pct)
+                peak_obs = max(o_price, o_high or 0.0)
+                if not state.get('runaway_blocked', False) and peak_obs >= runaway_thresh:
+                    state['runaway_blocked'] = True
+                    self.add_log(f"🛡️ [RUNAWAY SHIELD] {opt_type} {strike} surged +{runaway_pct*100:.0f}%+ vs open (₹{open_px:.2f} -> ₹{peak_obs:.2f}). Entries paused until reversion.")
+                elif state.get('runaway_blocked', False) and getattr(self, 'runaway_unlock_on_reversion', True) and o_price <= open_px:
+                    state['runaway_blocked'] = False
+                    self.add_log(f"🟢 [RUNAWAY UNLOCKED] {opt_type} {strike} reverted <= open (₹{o_price:.2f} <= ₹{open_px:.2f}). Resuming entry watch.")
+            if state.get('runaway_blocked', False):
+                return
                 
             # Recommendation 2: Cooldown Circuit Breaker Check
             cooldown_until = state.get('cooldown_until')
@@ -2087,7 +2130,10 @@ class LiveManager:
                 
             # Check SL
             if o_price >= state['current_sl']:
-                exit_fill_price = state['current_sl']
+                if self.mode == "LIVE" and getattr(self, 'realistic_paper_sl_fill', True) and o_price > state['current_sl']:
+                    exit_fill_price = round(o_price, 2)
+                else:
+                    exit_fill_price = state['current_sl']
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
                     exit_fill_price = self._close_position_real(symbol, 2 * self.lot_size, state, exit_fill_price, cancel_first=False)
@@ -2120,6 +2166,13 @@ class LiveManager:
                 
                 self.add_log(f"[{reason.upper()}] {opt_type} SL hit at {exit_fill_price:.2f} (PnL: ₹{pnl:.2f})")
                 send_telegram_alert(f"🛑 <b>{reason.upper()} HIT</b>\n{opt_type} {strike} Closed @ ₹{exit_fill_price:.2f}\nPnL: ₹{pnl:.2f}")
+
+                # Asymmetric 2-Consecutive-SL Trend Freeze
+                state['consec_sl'] = state.get('consec_sl', 0) + 1
+                if getattr(self, 'enable_2sl_trend_freeze', True) and state['consec_sl'] >= 2:
+                    state['trend_frozen'] = True
+                    self.add_log(f"🧊 [2-SL TREND FREEZE] {opt_type} hit {state['consec_sl']} consecutive SLs without a Lot-1 Target win. Freezing {opt_type} entries for today.")
+                    send_telegram_alert(f"🧊 <b>2-SL TREND FREEZE</b>\n{opt_type} hit 2 consecutive Stop Losses. Freezing {opt_type} for remainder of day.")
 
                 # Recommendation 2: Consecutive Loss Circuit Breaker Tracking
                 now_ts = current_time
@@ -2181,7 +2234,8 @@ class LiveManager:
                 }
                 save_live_trade(trade_rec)
                 
-                # Recommendation 2: Reset consecutive loss tracking when profit target is hit
+                # Reset consecutive loss tracking when profit target is hit
+                state['consec_sl'] = 0
                 state['recent_sl_times'] = []
                 
                 state['position'] = 'SHORT_1_LOT'
@@ -2207,7 +2261,10 @@ class LiveManager:
             
             # Check Trailing SL
             if o_price >= state['current_sl']:
-                exit_fill_price = state['current_sl']
+                if self.mode == "LIVE" and getattr(self, 'realistic_paper_sl_fill', True) and o_price > state['current_sl']:
+                    exit_fill_price = round(o_price, 2)
+                else:
+                    exit_fill_price = state['current_sl']
                 if self.mode == "LIVE_REAL" and self.kite:
                     symbol = self.get_option_symbol(strike, opt_type, current_time)
                     exit_fill_price = self._close_position_real(symbol, 1 * self.lot_size, state, exit_fill_price, cancel_first=False)
@@ -2237,6 +2294,44 @@ class LiveManager:
                 state['sl_order_id'] = None
                 self.add_log(f"[TRAILING SL] {opt_type} Trailing SL hit at {exit_fill_price:.2f} (PnL: ₹{pnl:.2f})")
                 send_telegram_alert(f"🛑 <b>TRAILING SL HIT</b>\n{opt_type} {strike} Exited Lot 2 @ ₹{exit_fill_price:.2f}\nPnL: ₹{pnl:.2f}")
+
+    def _reconcile_peak_x_from_exchange(self, current_time):
+        """Every 60s while flat, reconcile Day High X against Zerodha intraday OHLC.high to self-heal phantom ticks."""
+        if self.mode not in ["LIVE", "LIVE_REAL"] or not self.kite:
+            return
+        now_mono = time.time()
+        if now_mono - getattr(self, 'last_peak_reconcile_time', 0.0) < 60.0:
+            return
+        self.last_peak_reconcile_time = now_mono
+
+        sym_map = {}
+        for opt_type in ['PE', 'CE']:
+            st = self.strategy_state.get(opt_type, {})
+            if st.get('strike') is not None and st.get('position') is None and st.get('day_high', 0.0) > 0:
+                sym = self.get_option_symbol(st['strike'], opt_type, current_time)
+                if sym:
+                    sym_map[opt_type] = sym
+        if not sym_map:
+            return
+
+        try:
+            quotes = self.kite.quote(list(sym_map.values()))
+        except Exception:
+            return
+
+        with self.lock:
+            for opt_type, sym in sym_map.items():
+                q = quotes.get(sym, {})
+                ex_high = float(q.get("ohlc", {}).get("high", 0.0) or 0.0)
+                if ex_high <= 0:
+                    continue
+                st = self.strategy_state.get(opt_type, {})
+                if st.get('position') is not None:
+                    continue
+                old_x = st.get('day_high', 0.0)
+                if abs(ex_high - old_x) > 0.05:
+                    st['day_high'] = ex_high
+                    self.add_log(f"🔧 [PEAK HEALED] {opt_type} {st['strike']} Day High X synchronized to exchange OHLC: ₹{old_x:.2f} -> ₹{ex_high:.2f}")
 
     def _start_websocket(self):
         if not self.kite:
@@ -2613,6 +2708,10 @@ class LiveManager:
                             state['price'] = val
                         
                         self.add_log(f"Strike Selected: {opt_type} {strike} | Day High (X): {state['day_high']:.2f}")
+                        state['open_premium'] = state['price'] if state['price'] > 0 else state['day_high']
+                        state['runaway_blocked'] = False
+                        state['consec_sl'] = 0
+                        state['trend_frozen'] = False
                         target_entry = state['day_high'] * (1.0 - self.entry_discount)
                         if state['price'] > 0:
                             grace_lower_bound = state['day_high'] * (1.0 - (self.entry_discount + 0.05))
@@ -2629,6 +2728,10 @@ class LiveManager:
                 
                 # B. Strategy Rules check
                 if self.strategy_state['PE']['strike'] is not None:
+                    # Periodic 60s exchange OHLC peak X reconciliation while flat (heals phantom spikes / missed highs)
+                    if t_time >= datetime.time(9, 30) and t_time < datetime.time(15, 15):
+                        self._reconcile_peak_x_from_exchange(current_time)
+
                     # Watchdog Check for WebSocket Heartbeat (Live mode only)
                     if self.mode in ["LIVE", "LIVE_REAL"] and self.websocket_active and self.last_websocket_tick_time:
                         elapsed = (datetime.datetime.now(datetime.timezone.utc) - self.last_websocket_tick_time).total_seconds()
